@@ -23,7 +23,7 @@ while read -r ref sha remote_ref remote_sha; do
 		[ "$there" = "$id" ] || exit 2
 	) 2> /dev/null < /dev/null
 	if [ $? -eq 2 ]; then
-		echo "DLF: ${remote_ref#refs/heads/} now lists large files that are not uploaded for it. Others cannot download them until you use Upload in the DLF window (Tools > DLF > DLF)." >&2
+		echo "DLF: ${remote_ref#refs/heads/} now lists large files that are not uploaded for it, so the team cannot download them. Use Upload in the DLF window (Tools > DLF)." >&2
 	fi
 done
 exit 0

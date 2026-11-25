@@ -67,6 +67,20 @@ fail() {
 	exit 1
 }
 
+# What a command is doing, for the Unity window's progress: "PROGRESS done total text", total 0 when there is nothing
+# to count. It goes to the command's own output (descriptor 3), also from inside functions whose output is captured
+exec 3>&1
+progress() { echo "PROGRESS $1 $2 $3" >&3; }
+
+# A size in bytes, readable
+size_of() { awk -v b="$1" 'BEGIN { split("B KB MB GB TB", u); i = 1; while (b >= 1024 && i < 5) { b /= 1024; i++ } printf (i == 1 ? "%d %s" : "%.1f %s"), b, u[i] }'; }
+
+# Removes the given paths from what was seen, so that those files go on counting as changed here
+forget_seen() {
+	awk 'FILENAME == ARGV[1] { named[$0]; next } { path = $0; sub(/^[^\/]*\/[^\/]*\//, "", path); if (!(path in named)) print }' "$1" "$state/seen" > "$work/seen.kept"
+	mv "$work/seen.kept" "$state/seen"
+}
+
 # The files the patterns match, sorted and NUL separated. Git does the matching, the same way on every system:
 # * and ? stay within one folder or file name, ** crosses folders
 shared_files() {
@@ -87,7 +101,7 @@ seen() {
 # gigabytes takes a while, so only the files whose size or time changed since the last list are read: the others
 # keep the hash that list has for them
 local_list() {
-	echo "DLF: checking the shared large files..." >&2
+	progress 0 0 "Checking which shared files changed"
 	# What is remembered for this list is taken before the hashing, so that a file written during it counts as changed
 	seen > "$work/seen"
 	: > "$work/known"
@@ -98,6 +112,8 @@ local_list() {
 	fi
 	cut -d' ' -f2- "$work/known" | sort > "$work/same"
 	shared_files | tr '\0' '\n' | sort | comm -23 - "$work/same" | tr '\n' '\0' > "$work/names"
+	count=$(tr -cd '\000' < "$work/names" | wc -c | tr -d ' ')
+	[ "$count" -eq 0 ] || progress 0 0 "Hashing $count changed files"
 	{
 		cat "$work/known"
 		[ -s "$work/names" ] && xargs -0 $hasher < "$work/names" | sed 's/^\([0-9a-f]*\) [ *]/\1 /'
@@ -140,12 +156,12 @@ current_list() {
 
 # Requests are signed with this key. It is handed to curl in a file only this user can read, not on the command line
 use_key() {
-	[ -n "$project" ] || fail "DLF.cfg has no project name. Enter one in Tools > DLF > Settings."
+	[ -n "$project" ] || fail "DLF.cfg has no project name. Enter one in the DLF settings (Tools > DLF, then the gear)."
 	(umask 077 && printf 'user = "%s:%s"\n' "$1" "$2" > "$work/key")
 }
 
 use_write_key() {
-	[ -f "$keys" ] || fail "this machine has no write key. Enter one in Tools > DLF > Settings."
+	[ -f "$keys" ] || fail "this machine has no upload key. Enter one in the DLF settings (Tools > DLF, then the gear)."
 	use_key "$(value accessKeyId "$keys")" "$(value secretAccessKey "$keys")"
 }
 
@@ -154,7 +170,7 @@ use_read_key() {
 	if [ -f "$keys" ]; then
 		use_write_key
 	else
-		[ -n "$(value readSecretAccessKey "$cfg")" ] || fail "DLF.cfg has no read key. Enter one in Tools > DLF > Settings."
+		[ -n "$(value readSecretAccessKey "$cfg")" ] || fail "DLF.cfg has no read key. Enter one in the DLF settings (Tools > DLF, then the gear)."
 		use_key "$(value readAccessKeyId "$cfg")" "$(value readSecretAccessKey "$cfg")"
 	fi
 }
@@ -178,7 +194,7 @@ get() {
 	case "$code" in
 		200) ;;
 		404) : > "$2" ;;
-		*) fail "could not reach the bucket (answer $code). Try again." ;;
+		*) fail "could not reach the server (answer $code). Check your internet connection and try again." ;;
 	esac
 }
 
@@ -194,7 +210,7 @@ put() {
 names() {
 	token=
 	while :; do
-		signed "$endpoint/$bucket?list-type=2&prefix=$project/$1${token:+&continuation-token=$token}" > "$work/page" || fail "could not list the bucket."
+		signed "$endpoint/$bucket?list-type=2&prefix=$project/$1${token:+&continuation-token=$token}" > "$work/page" || fail "could not reach the server to see its files. Check your internet connection and try again."
 		tr '<' '\n' < "$work/page" | sed -n "s|^Key>$project/||p"
 		# A long listing comes in pages
 		token=$(tr '<' '\n' < "$work/page" | sed -n 's|^NextContinuationToken>||p' | head -n 1)
@@ -221,11 +237,13 @@ branch_key() {
 
 # Stops while someone else is uploading: files are being added and removed
 check_lock() {
+	progress 0 0 "Checking that nobody else is uploading"
 	get lock "$work/lock"
 	IFS='|' read -r owner since what < "$work/lock" || true
 	rm -f "$work/lock"
 	if [ -n "$since" ] && [ $(($(date +%s) - since)) -lt $lock_seconds ] && [ "$owner" != "$me" ]; then
-		fail "$owner is uploading $what right now. Try again in a moment (Unlock in the DLF window clears a lock that was left behind)."
+		who=$(printf '%s' "$owner" | sed 's/@\(.*\)/ (on \1)/')
+		fail "$who is uploading large files right now. Try again in a moment. (If that upload was cut off, Unlock in the DLF window clears it.)"
 	fi
 }
 
@@ -257,7 +275,7 @@ selected() {
 
 # apply LIST: makes the local shared files the ones the sorted list in the file LIST names. Files it does not name
 # are removed, files that differ from it are downloaded. The caller has listed the files as they are now in
-# $work/have. Prints "PROGRESS done total path"
+# $work/have
 apply() {
 	check_lock
 	comm -23 "$1" "$work/have" > "$work/needed"
@@ -266,11 +284,13 @@ apply() {
 		rm -rf "$work/in"
 		mkdir -p "$work/in"
 		total=$(wc -l < "$work/needed" | tr -d ' ')
-		echo "PROGRESS 0 $total downloading"
+		count=$(cut -d' ' -f1 "$work/needed" | sort -u | wc -l | tr -d ' ')
+		progress 0 0 "Downloading $count files from the server"
 		cut -d' ' -f1 "$work/needed" | sort -u | while read -r hash; do
 			printf 'url = "%s/%s/%s/files/%s"\noutput = "%s/in/%s.gz"\n' "$endpoint" "$bucket" "$project" "$hash" "$work" "$hash"
 		done > "$work/get"
-		signed --parallel --parallel-max 8 -K "$work/get" 2> /dev/null || fail "some of the files DLF.txt lists are not in the bucket (any more), or it could not be reached. Nothing was changed."
+		signed --parallel --parallel-max 8 -K "$work/get" 2> /dev/null || fail "some large files could not be downloaded: the server does not have them (any more), or could not be reached. Nothing was changed."
+		progress 0 0 "Unpacking and checking $count files"
 		for packed in "$work"/in/*.gz; do
 			gzip -dc "$packed" > "${packed%.gz}" || fail "a downloaded file is damaged."
 			rm -f "$packed"
@@ -283,7 +303,7 @@ apply() {
 		folder=
 		while read -r hash path; do
 			done=$((done + 1))
-			echo "PROGRESS $done $total $path"
+			progress "$done" "$total" "Putting in place $path"
 			case "$path" in */*) [ "${path%/*}" = "$folder" ] || { folder=${path%/*}; mkdir -p "$folder"; } ;; esac
 			# Moved, not copied, so that a download needs no room for a second copy. A content listed under two names
 			# is copied from where the first one went
@@ -310,11 +330,11 @@ differing() { sort "$1" "$2" | uniq -u | cut -d' ' -f2- | sort -u; }
 # A line is a 64 character hash, a space, and the path
 lines_at() { awk -v wanted="$3" 'FILENAME == ARGV[1] { named[$0]; next } ((substr($0, 66) in named) == wanted)' "$1" "$2"; }
 
-# sync [--all | PATH...]: brings the shared files in line with DLF.txt, file by file, the way git merges. Compared
-# with the list this machine last took: a file that only changed in DLF.txt is downloaded (or removed), a file that
-# only changed here is left alone, and a file that changed on both sides is left alone and named in $work/conflicts.
-# Changes made here to the selected paths, or with --all to any, are thrown away instead: those files become the
-# listed ones too
+# sync [--all | --missing | PATH...]: brings the shared files in line with DLF.txt, file by file, the way git merges.
+# Compared with the list this machine last took: a file that only changed in DLF.txt is downloaded (or removed), a file
+# that only changed here is left alone, and a file that changed on both sides is left alone and named in
+# $work/conflicts. Changes made here to the selected paths, or with --all to any, are thrown away instead: those files
+# become the listed ones too. With --missing, files deleted here come back; other changes made here are kept
 sync() {
 	tr -d '\r' < DLF.txt | sort > "$work/theirs"
 	# The list must never reach outside the repository, into git's own folder, or over a file git keeps
@@ -338,6 +358,8 @@ sync() {
 	differing "$work/base" "$work/have" > "$work/changed"
 	if [ "$1" = --all ]; then
 		: > "$work/kept"
+	elif [ "$1" = --missing ]; then
+		cut -d' ' -f2- "$work/have" | sort | comm -12 "$work/changed" - > "$work/kept"
 	elif [ $# -eq 0 ]; then
 		cp "$work/changed" "$work/kept"
 	else
@@ -365,11 +387,8 @@ sync() {
 	fi
 	apply "$work/target"
 	mark_synced < "$work/taken"
-	if [ -s "$work/kept" ]; then
-		# The files that keep a change made here go on counting as changed: they are left out of what was seen
-		awk 'FILENAME == ARGV[1] { named[$0]; next } { path = $0; sub(/^[^\/]*\/[^\/]*\//, "", path); if (!(path in named)) print }' "$work/kept" "$state/seen" > "$work/seen.kept"
-		mv "$work/seen.kept" "$state/seen"
-	fi
+	# The files that keep a change made here go on counting as changed
+	[ ! -s "$work/kept" ] || forget_seen "$work/kept"
 	# $work/target stays: it lists the files as they are now, which an upload needs next
 	rm -f "$work/theirs" "$work/base" "$work/have" "$work/changed" "$work/kept" "$work/taken"
 }
@@ -377,39 +396,62 @@ sync() {
 # After sync: names the files it left alone because they changed on both sides, and fails when there are any
 report_conflicts() {
 	if [ -s "$work/conflicts" ]; then
-		echo "DLF: these files changed both on this machine and in DLF.txt, and were left as they are here:" >&2
+		echo "DLF: you and someone else both changed these large files. Yours were left as they are:" >&2
 		sed 's/^/  /' "$work/conflicts" >&2
-		echo "In the DLF window: Upload shares yours, Reset takes the listed ones instead." >&2
+		echo "In the DLF window: Upload to keep yours, or tick them and Reset to take the team's." >&2
 		rm -f "$work/conflicts"
 		return 1
 	fi
 	rm -f "$work/conflicts"
 }
 
-# upload BRANCH: lists the shared files as they are now in DLF.txt and puts them in the bucket as BRANCH's set.
-# New files go up first, then the branch's list, then files nothing needs any more are removed. DLF.txt is left for
-# the author to commit. Stops when it must not replace what is there
+# upload BRANCH [PATH...]: lists the shared files as they are now in DLF.txt and puts them in the bucket as BRANCH's
+# set. With paths, only the files changed here that they select are shared: the other changes stay on this machine,
+# and DLF.txt keeps listing those files as before. New files go up first, then the branch's list, then files nothing
+# needs any more are removed. DLF.txt is left for the author to commit. Stops when it must not replace what is there
 upload() {
 	branch=$1
+	shift
 	merged=
 	use_write_key
 	# What DLF.txt lists and this machine never took is taken first, file by file: an upload lists the files as they
 	# are here, and must not put older ones back. A file that changed on both sides stays as it is here
 	if [ -f DLF.txt ] && [ "$(cat "$state/synced" 2> /dev/null)" != "$(list_id < DLF.txt)" ]; then
+		progress 0 0 "Downloading the team's newer large files first"
 		if (sync); then
 			merged=1
 		else
-			echo "DLF: could not download the files DLF.txt lists first; uploading the files as they are here." >&2
+			echo "DLF: could not download the team's newer large files first; uploading yours as they are." >&2
 		fi
 		rm -f "$work/conflicts"
 	fi
 	if [ -n "$merged" ]; then
 		# Hashed a moment ago, by the merge
-		sort -k 2 "$work/target" > "$work/new"
+		sort -k 2 "$work/target" > "$work/now"
 	else
-		current_list > "$work/new"
+		current_list > "$work/now"
 	fi
-	[ -s "$work/new" ] || fail "nothing to upload: no file matches the patterns in DLF.cfg."
+	: > "$work/unpicked"
+	if [ $# -eq 0 ]; then
+		mv "$work/now" "$work/new"
+	else
+		# The files changed here and not selected keep the line the list last taken has for them (none: not shared yet)
+		if [ -f "$state/synced" ] && git cat-file -e "$(cat "$state/synced")" 2> /dev/null; then
+			git cat-file blob "$(cat "$state/synced")" | sort > "$work/base"
+		else
+			: > "$work/base"
+		fi
+		sort "$work/now" > "$work/now.sorted"
+		differing "$work/base" "$work/now.sorted" | while IFS= read -r path; do
+			selected "$path" "$@" || printf '%s\n' "$path"
+		done > "$work/unpicked"
+		{
+			lines_at "$work/unpicked" "$work/now" 0
+			lines_at "$work/unpicked" "$work/base" 1
+		} | sort -k 2 > "$work/new"
+		rm -f "$work/now" "$work/now.sorted" "$work/base"
+	fi
+	[ -s "$work/new" ] || fail "nothing to upload: no files match the patterns in the DLF settings."
 	id=$(list_id < "$work/new")
 	get "$(branch_key "$branch")" "$work/old"
 	old_id=$(list_id < "$work/old")
@@ -418,17 +460,18 @@ upload() {
 	# there is nothing to protect: the set is whatever was uploaded last
 	if [ "$one_set" != true ] && [ -s "$work/old" ] && [ "$old_id" != "$id" ] && [ "$old_id" != "$(cat "$state/uploaded" 2> /dev/null)" ]; then
 		known=$(git rev-list HEAD -- DLF.txt 2> /dev/null | while read -r past; do git rev-parse -q --verify "$past:DLF.txt"; done | grep -c "^$old_id$")
-		[ "$known" -gt 0 ] || fail "not uploaded: someone else uploaded other files for $branch. Get their commit and upload again: your changed files are kept, theirs are downloaded."
+		[ "$known" -gt 0 ] || fail "not uploaded: someone else uploaded large files for $branch since you last pulled. Pull, then upload again: your changes are kept."
 	fi
 	# From here on the upload is not refused any more: DLF.txt becomes the list of the files as they are here
 	if [ ! -f DLF.txt ] || [ "$(list_id < DLF.txt)" != "$id" ]; then
 		cp "$work/new" DLF.txt
 	fi
 	mark_synced < "$work/new"
+	[ ! -s "$work/unpicked" ] || forget_seen "$work/unpicked"
 	if [ "$old_id" = "$id" ]; then
 		echo "$id" > "$state/uploaded"
 		rm -f "$work/old" "$work/new"
-		echo "DLF: nothing to upload, the bucket already has these files for $branch." >&2
+		echo "DLF: nothing to upload: the server already has these large files." >&2
 		return 0
 	fi
 	check_lock
@@ -437,24 +480,29 @@ upload() {
 	[ -n "$since" ] && r2 DELETE lock > /dev/null 2>&1
 	printf '%s|%s|%s' "$me" "$(date +%s)" "$branch" > "$work/lock"
 	# The bucket only takes this write while there is no lock: of two uploaders starting together, one is refused
-	put lock "$work/lock" -H 'If-None-Match: *' 2> /dev/null || fail "not uploaded: someone else started uploading at the same moment, or the bucket could not be reached. Try again."
+	put lock "$work/lock" -H 'If-None-Match: *' 2> /dev/null || fail "not uploaded: someone else started uploading at the same moment, or the server could not be reached. Try again."
 	rm -f "$work/lock"
 	locked=1
-	echo "DLF: uploading the large files of $branch..." >&2
+	progress 0 0 "Checking which files the server already has"
 	names files/ | sed 's|^files/||' | sort > "$work/there"
-	total=$(wc -l < "$work/new" | tr -d ' ')
+	# Each content the bucket does not have yet goes up once, whatever names it has
+	cut -d' ' -f1 "$work/new" | sort -u | comm -23 - "$work/there" > "$work/missing"
+	total=$(wc -l < "$work/missing" | tr -d ' ')
 	done=0
 	while read -r hash path; do
-		done=$((done + 1))
+		grep -qxF "$hash" "$work/missing" || continue
 		grep -qxF "$hash" "$work/there" && continue
-		echo "PROGRESS $done $total $path"
+		done=$((done + 1))
+		progress "$done" "$total" "Uploading $path ($(size_of "$(wc -c < "$path")"))"
 		gzip -1 -c "$path" > "$work/tmp"
 		put "files/$hash" "$work/tmp" || fail "not uploaded: could not upload $path."
 		echo "$hash" >> "$work/there"
 	done < "$work/new"
-	put "$(branch_key "$branch")" "$work/new" || fail "not uploaded: could not upload the list."
+	progress 0 0 "Saving the list of large files on the server"
+	put "$(branch_key "$branch")" "$work/new" || fail "not uploaded: could not save the list of large files on the server."
 	echo "$id" > "$state/uploaded"
 	if [ "$keep" != true ]; then
+		progress 0 0 "Removing files nothing needs any more"
 		# The list of a branch that is gone is removed, when it is safe to: the branch is on no remote (the remotes are
 		# asked, what this machine last fetched may be out of date) and not on this machine, and its list is in the
 		# history of a pushed branch, so it was merged. A list nobody committed stays: it may be someone's work
@@ -491,8 +539,8 @@ upload() {
 	fi
 	r2 DELETE lock > /dev/null
 	locked=
-	rm -f "$work/old" "$work/new" "$work/other" "$work/lists" "$work/there" "$work/kept" "$work/tmp"
-	echo "DLF: uploaded. Commit DLF.txt with the changes that need these files." >&2
+	rm -f "$work/old" "$work/new" "$work/other" "$work/lists" "$work/there" "$work/missing" "$work/kept" "$work/tmp" "$work/unpicked"
+	echo "DLF: uploaded. Now commit DLF.txt (the list of large files) and push, so the team gets them." >&2
 }
 
 # The marked block that has git run a DLF hook first, ahead of whatever the hook file already does. The DLF hooks only

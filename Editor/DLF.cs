@@ -116,7 +116,7 @@ public sealed class DLF : IPreprocessBuildWithReport {
 				return;
 			}
 			// While another run goes, the next focus tries again
-			if (RunInBackground("download", null, Report, "Downloading the shared large files")) {
+			if (RunInBackground("download", null, Report, "Downloading the team's large files")) {
 				SessionState.SetString(k_TriedKey, pointer);
 			}
 		};
@@ -232,7 +232,8 @@ public sealed class DLF : IPreprocessBuildWithReport {
 		Job job = null;
 		if (title != null) {
 			busy = true;
-			id = Progress.Start("DLF", title);
+			// The title names the run; the description below it follows the step the script is at
+			id = Progress.Start(title, "Starting");
 			Progress.RegisterCancelCallback(id, () => {
 				var running = job;
 				if (running != null) {

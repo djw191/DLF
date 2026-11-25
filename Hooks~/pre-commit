@@ -4,8 +4,8 @@
 . "$(dirname "$0")/dlf.sh"
 [ -f "$keys" ] || exit 0
 if [ -f "$state/synced" ] && ! unchanged; then
-	echo "DLF: shared large files changed on this machine and are not uploaded. If this commit needs them, use Upload in the DLF window (Tools > DLF > DLF) and commit DLF.txt with it." >&2
+	echo "DLF: large files you changed are not uploaded. If this commit needs them, use Upload in the DLF window (Tools > DLF), then commit DLF.txt with it." >&2
 elif [ -n "$(git diff --name-only -- DLF.txt)" ]; then
-	echo "DLF: DLF.txt has changes that are not part of this commit. Stage it if this commit needs the new files." >&2
+	echo "DLF: DLF.txt (the list of large files) changed but is not in this commit. Stage it if this commit needs the new large files." >&2
 fi
 exit 0

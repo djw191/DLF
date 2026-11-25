@@ -58,6 +58,8 @@ echo "--- 1b files deleted after an upload"
 rm Big/a.bin "Big/b with space.bin"
 check "status lists them as deleted here" "$(status changed | grep -c 'changed=D')" 1
 dlf download > /dev/null 2>&1; check "a download leaves that alone" "$(has Big/a.bin)" gone
+dlf download --missing > /dev/null 2>&1; check "the Download button brings missing files back" "$(cat Big/a.bin)$(cat 'Big/b with space.bin')" onetwo
+rm Big/a.bin "Big/b with space.bin"
 dlf reset > /dev/null 2>&1; check "reset succeeds, with a DLF.txt that is not committed" $? 0
 check "and brings the deleted files back" "$(cat Big/a.bin)$(cat 'Big/b with space.bin')" onetwo
 check "status: nothing left" "$(status 'changed|incoming')" ""
@@ -83,7 +85,7 @@ check "a file in a subfolder arrives" "$(cat Big/sub/d.dat)" deep
 dlf reset > /dev/null 2>&1; check "reset succeeds" $? 0
 check "it replaces the changed file" "$(cat Big/a.bin)" one
 check "and removes the file the list does not name" "$(has Big/extra.bin)" gone
-check "a second download has nothing to do, without hashing" "$(dlf download 2>&1 | grep -c checking)" 0
+check "a second download has nothing to do, without hashing" "$(dlf download 2>&1 | grep -c Hashing)" 0
 check "status: nothing left" "$(status 'changed|incoming')" ""
 
 echo "--- 4 a file changes and one is removed (a rebake)"
@@ -92,6 +94,8 @@ OLD=$(grep ' Big/a.bin$' DLF.txt | cut -d' ' -f1)
 sleep 1; echo changed > Big/a.bin; rm "Big/b with space.bin"; echo three > Big/c.bin
 check "status lists each changed file: modified, deleted, added" "$(status changed)" "changed=A Big/c.bin changed=D Big/b with space.bin changed=M Big/a.bin "
 dlf download > /dev/null 2>&1; check "a download leaves changes that are not uploaded alone" "$(cat Big/a.bin)" changed
+dlf download --missing > /dev/null 2>&1; check "the Download button brings back the deleted file, and keeps the changed ones" "$(cat 'Big/b with space.bin')$(cat Big/a.bin)$(cat Big/c.bin)" twochangedthree
+sleep 1; rm "Big/b with space.bin"
 dlf upload > /dev/null 2>&1; check "upload succeeds" $? 0
 check "git shows which files changed" "$(git diff --stat DLF.txt | grep -c 'DLF.txt')" 1
 check "the branch's list is the new DLF.txt" "$(same "${O}branches__main" DLF.txt)" same
@@ -280,6 +284,15 @@ sleep 1; echo moved-on > Big/c.bin; share moved-on
 check "a file with the same size and time keeps its hash: it is not read again" "$(grep ' Big/t1.bin$' DLF.txt | cut -c1-64)" "$(echo twin | sha256sum | cut -c1-64)"
 check "a changed file gets its new hash" "$(grep ' Big/c.bin$' DLF.txt | cut -c1-64)" "$(echo moved-on | sha256sum | cut -c1-64)"
 rm Big/t1.bin; dlf reset > /dev/null 2>&1
+sleep 1; echo picked > Big/a.bin; echo unpicked > Big/c.bin
+dlf upload Big/a.bin > "$T/out" 2>&1; check "an upload of the ticked files only succeeds" $? 0
+check "it says what it uploads, and how big" "$(grep -c '^PROGRESS 1 1 Uploading Big/a.bin (7 B)$' "$T/out")" 1
+check "the ticked file is listed as it is here" "$(grep ' Big/a.bin$' DLF.txt | cut -c1-64)" "$(echo picked | sha256sum | cut -c1-64)"
+check "the other keeps its old line" "$(grep ' Big/c.bin$' DLF.txt | cut -c1-64)" "$(echo moved-on | sha256sum | cut -c1-64)"
+check "and is not in the bucket" "$(has "${O}files__$(echo unpicked | sha256sum | cut -c1-64)")" gone
+check "status: the other is still changed here, nothing to download" "$(status 'changed|incoming')" "changed=M Big/c.bin "
+check "the change stays on this machine" "$(cat Big/c.bin)" unpicked
+dlf reset > /dev/null 2>&1; git checkout -q -- DLF.txt; dlf reset > /dev/null 2>&1
 
 echo "--- 13c hooks and .gitignore"
 git init -q -b main "$T/i"; cd "$T/i"; git config user.name i; git config user.email i@t; git config core.autocrlf false

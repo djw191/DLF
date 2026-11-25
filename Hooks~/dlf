@@ -1,7 +1,9 @@
 #!/bin/sh
 # The DLF command, run from the top of the repository (Unity runs it for the DLF window, on start and before a build):
-#   dlf download         takes what is new in DLF.txt, file by file: files changed on this machine are left alone
-#   dlf upload           lists the shared files as they are now in DLF.txt and puts them in the bucket
+#   dlf download [--missing]  takes what is new in DLF.txt, file by file: files changed on this machine are left
+#                        alone. With --missing (the Download button), files deleted here come back too
+#   dlf upload [PATH...] lists the shared files as they are now in DLF.txt and puts them in the bucket; with paths,
+#                        only those of the files changed here
 #   dlf reset [PATH...]  throws changes made on this machine away: the shared files, or only the selected ones,
 #                        become the ones DLF.txt lists
 #   dlf unlock           clears a lock an upload left behind
@@ -20,15 +22,17 @@ case "$command" in
 		;;
 	download)
 		[ -f DLF.txt ] || exit 0
-		# Nothing new in DLF.txt since this machine last took it: files changed or deleted here are left alone
-		[ "$(cat "$state/synced" 2> /dev/null)" = "$(list_id < DLF.txt)" ] && exit 0
+		# Nothing new in DLF.txt since this machine last took it, and nothing missing asked for: nothing to do
+		if [ "$1" != --missing ] && [ "$(cat "$state/synced" 2> /dev/null)" = "$(list_id < DLF.txt)" ]; then
+			exit 0
+		fi
 		use_read_key
-		sync
+		sync "$@"
 		report_conflicts
 		;;
 	upload)
 		branch=$(current_branch) || fail "nothing to upload: no branch is checked out."
-		upload "$branch"
+		upload "$branch" "$@"
 		;;
 	reset)
 		[ -f DLF.txt ] || fail "there is no DLF.txt yet, so there is nothing to reset to."

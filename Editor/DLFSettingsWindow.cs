@@ -22,8 +22,8 @@ public sealed class DLFSettingsWindow : EditorWindow {
 	private bool m_ShowKeys, m_KeepOldVersions, m_OneSet;
 	private static GUIStyle s_Size, s_Folder;
 
-	[MenuItem("Tools/DLF/Settings")]
-	private static void Open() {
+	// Opened from the gear of the DLF window: settings are rare, so they have no menu item of their own
+	internal static void Open() {
 		var window = GetWindow<DLFSettingsWindow>("DLF Settings");
 		window.minSize = new Vector2(420, 300);
 		// By default just tall enough to end below the collapsed Keys header; opening Keys scrolls

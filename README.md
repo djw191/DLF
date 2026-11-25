@@ -33,7 +33,7 @@ A file stays in the bucket while a list there names it, or the newest pushed com
 with different files can all download, a new branch costs nothing until its files differ, nobody loses files between
 your upload and your push, and several projects can share one bucket.
 
-Two settings change that, both in `Tools > DLF > Settings` under `Keys > Bucket`:
+Two settings change that, both in the DLF settings (`Tools > DLF`, then the gear) under `Keys > Bucket`:
 
 - **One Set For All Branches** (`oneSetForAllBranches=true`): all branches share one list, `<project>/set`, which holds
   whatever was uploaded last. Smallest bucket; a branch whose files were replaced by another's can no longer download.
@@ -65,11 +65,11 @@ it: keep one side's line for each file, then download.
 1. Add the package to the Unity project (Package Manager, "Add package from git URL", or a line in
    `Packages/manifest.json`). It can also live inside the repository as an embedded package or a submodule.
 2. Create a bucket and two API tokens for it: one read-only, one read and write.
-3. Open `Tools > DLF > Settings`, open `Keys`, and fill in the bucket, a project name, the read key and, on a machine
+3. Open `Tools > DLF`, then its settings (the gear), open `Keys`, and fill in the bucket, a project name, the read key and, on a machine
    that uploads, the write key. Enter the patterns of the files to share. Save.
 4. Commit `DLF.cfg` and `.gitignore`. Saving listed the patterns in `.gitignore`: files that git already tracks must be
    removed from git by hand (`git rm --cached`).
-5. On the machine with the write key, open `Tools > DLF > DLF`, press Upload, and commit `DLF.txt`.
+5. On the machine with the write key, open `Tools > DLF`, press Upload, and commit `DLF.txt`.
 
 On a machine with a write key, the Editor adds the two reminder hooks without taking over the repository's hooks: it
 copies the scripts to `.git/dlf-hooks/` and adds a marked block to the normal `pre-commit` and `pre-push` hooks in
@@ -79,25 +79,27 @@ write key gets no hooks. The block never stops a commit or a push, and the copie
 
 ## The two windows
 
-- **`Tools > DLF > DLF`** shows where things stand, the way a git client shows changes: the files that changed on this
+- **`Tools > DLF`** shows where things stand, the way a git client shows changes: the files that changed on this
   machine (added, modified, deleted) and the ones a download would bring, whether `DLF.txt` is committed, and whether
-  the bucket has it. Its buttons are every action: Download, Upload, Reset All, Reset Ticked, Unlock. Only a reset
-  ever replaces a file that was changed on this machine.
-- **`Tools > DLF > Settings`** holds the patterns, the bucket and the keys.
+  the bucket has it. Its buttons are every action: Download, Upload, Reset, and Unlock when a lock was left behind.
+  The changed files have tick boxes, ticked when a change shows up: Upload shares the ticked ones and Reset throws
+  their changes away. Only a reset ever replaces a file that was changed on this machine.
+- **Its settings** (the gear at the top) hold the patterns, the bucket and the keys.
 
 A status line in the corner of the Scene view names the next step, if there is one: files to download, a newer
-`DLF.txt` to pull (as of the last fetch), files to upload, `DLF.txt` to commit or to push. Otherwise it says all is
-good. A click on it opens the DLF window.
+`DLF.txt` to pull (as of the last fetch), files to upload, `DLF.txt` to commit or to push. With nothing to do it is
+not shown. A click on it opens the DLF window.
 
 ## Everyday use
 
 - **Change the shared files:** open the DLF window, press Upload, then commit `DLF.txt` together with the changes
-  that need the new files.
+  that need the new files. Untick a change to keep it on this machine for now.
 - **Get someone else's change:** get their commit and switch to Unity. It downloads what changed, and leaves the
   files you changed yourself alone.
 - **Not ready to share a change:** do nothing. Files that changed on your machine stay there until you upload.
-- **Throw a change away, or get a deleted file back:** Reset All makes every shared file the one `DLF.txt` lists.
-  Reset Ticked does it for the files ticked in the window's list of changes. To undo an upload that is not committed
+- **Throw a change away:** Reset makes the ticked files the ones `DLF.txt` lists.
+- **Get a deleted file back:** Download. A deleted file is not ticked when it shows up, so that Upload does not delete
+  it for the whole team by accident; tick it to do exactly that. To undo an upload that is not committed
   yet, discard the change to `DLF.txt` in git first.
 
 ## Limits
