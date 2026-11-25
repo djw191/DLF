@@ -1,9 +1,9 @@
 #!/bin/sh
 # The DLF command, run from the top of the repository (Unity runs it for the DLF window, on start and before a build):
-#   dlf download [auto]  makes the shared files the ones DLF.txt lists; with auto, not over files changed here
+#   dlf download         takes what is new in DLF.txt, file by file: files changed on this machine are left alone
 #   dlf upload           lists the shared files as they are now in DLF.txt and puts them in the bucket
-#   dlf reset [PATH...]  throws local changes away: the shared files, or only the selected ones, become the ones the
-#                        checked-out commit lists, and DLF.txt goes back to that commit's
+#   dlf reset [PATH...]  throws changes made on this machine away: the shared files, or only the selected ones,
+#                        become the ones DLF.txt lists
 #   dlf unlock           clears a lock an upload left behind
 #   dlf status           prints what the DLF window shows: this machine's files, DLF.txt, and the bucket
 #   dlf keypath          prints where this machine's write key is kept
@@ -16,31 +16,25 @@ case "$command" in
 		;;
 	download)
 		[ -f DLF.txt ] || exit 0
-		# Nothing to do while DLF.txt is the list this checkout already took. Files changed here since then (a rebake that
-		# is not uploaded yet) are left alone: only a new DLF.txt, or reset, replaces them
+		# Nothing new in DLF.txt since this machine last took it: files changed or deleted here are left alone
 		[ "$(cat "$state/synced" 2> /dev/null)" = "$(list_id < DLF.txt)" ] && exit 0
-		# "download auto" is what Unity runs by itself: it never replaces files that were changed here and not uploaded.
-		# That is a conflict for a person to settle, with Download or Reset in the DLF window, or by uploading
-		if [ "$1" = auto ] && [ -f "$state/synced" ] && ! unchanged; then
-			fail "DLF.txt lists new files, but large files were changed on this machine and not uploaded, so nothing was downloaded. Open the DLF window: Download replaces your changes, Upload shares them."
-		fi
 		use_read_key
-		tr -d '\r' < DLF.txt > "$state/list"
-		apply "$state/list"
-		rm -f "$state/list"
+		sync
+		report_conflicts
 		;;
 	upload)
 		branch=$(current_branch) || fail "nothing to upload: no branch is checked out."
 		upload "$branch"
 		;;
 	reset)
+		[ -f DLF.txt ] || fail "there is no DLF.txt yet, so there is nothing to reset to."
 		use_read_key
-		git show HEAD:DLF.txt > "$state/list" 2> /dev/null || fail "the checked-out commit has no DLF.txt, so there is nothing to reset to."
-		apply "$state/list" "$@"
-		rm -f "$state/list"
 		if [ $# -eq 0 ]; then
-			git checkout -q HEAD -- DLF.txt
+			sync --all
+		else
+			sync "$@"
 		fi
+		report_conflicts
 		;;
 	unlock)
 		use_write_key
@@ -56,41 +50,46 @@ case "$command" in
 		if [ -f DLF.txt ]; then
 			echo "files=$(wc -l < DLF.txt | tr -d ' ')"
 			if [ -z "$(git status --porcelain -- DLF.txt)" ]; then echo "committed=yes"; else echo "committed=no"; fi
+			# A commit that changed DLF.txt and is on no remote yet; and one on the branch's remote that is not here yet,
+			# as of the last fetch (this asks no server)
+			if [ -n "$(git remote)" ] && [ -n "$(git rev-list -n 1 HEAD --not --remotes -- DLF.txt 2> /dev/null)" ]; then echo "pushed=no"; fi
+			if [ -n "$(git rev-list -n 1 'HEAD..@{upstream}' -- DLF.txt 2> /dev/null)" ]; then echo "behind=yes"; fi
 		fi
 		# Per file, as git status does. "changed": this machine's files against the list it last took (added, deleted,
 		# or written since). "incoming": that list against DLF.txt, which is what a download would bring
 		if [ -f "$state/synced" ] && git cat-file -e "$(cat "$state/synced")" 2> /dev/null; then
-			git cat-file blob "$(cat "$state/synced")" | sort > "$state/have"
+			git cat-file blob "$(cat "$state/synced")" | sort > "$work/have"
 		else
-			: > "$state/have"
+			: > "$work/have"
 		fi
-		cut -d' ' -f2- "$state/have" | sort > "$state/have.paths"
-		shared_files | tr '\000' '\n' | sort > "$state/here"
-		comm -13 "$state/have.paths" "$state/here" | sed 's/^/changed=A /'
-		comm -23 "$state/have.paths" "$state/here" | sed 's/^/changed=D /'
-		comm -12 "$state/have.paths" "$state/here" | while IFS= read -r file; do
-			if [ "$file" -nt "$state/synced" ]; then echo "changed=M $file"; fi
-		done
+		cut -d' ' -f2- "$work/have" | sort > "$work/have.paths"
+		shared_files | tr '\000' '\n' | sort > "$work/here"
+		comm -13 "$work/have.paths" "$work/here" | sed 's/^/changed=A /'
+		comm -23 "$work/have.paths" "$work/here" | sed 's/^/changed=D /'
+		# Modified: there before and now, with another size or time than when this machine last took the list
+		seen | sort > "$work/now"
+		sort "$state/seen" 2> /dev/null | comm -13 - "$work/now" | cut -d/ -f3- | sort > "$work/touched"
+		comm -12 "$work/have.paths" "$work/here" | comm -12 - "$work/touched" | sed 's/^/changed=M /'
 		if [ -f DLF.txt ]; then
-			tr -d '\r' < DLF.txt | sort > "$state/want"
-			comm -13 "$state/have" "$state/want" | cut -d' ' -f2- | while IFS= read -r file; do
-				if grep -qxF "$file" "$state/have.paths"; then echo "incoming=M $file"; else echo "incoming=A $file"; fi
-			done
-			cut -d' ' -f2- "$state/want" | sort | comm -23 "$state/have.paths" - | sed 's/^/incoming=D /'
+			tr -d '\r' < DLF.txt | sort > "$work/want"
+			comm -13 "$work/have" "$work/want" | cut -d' ' -f2- | sort > "$work/in"
+			comm -12 "$work/in" "$work/have.paths" | sed 's/^/incoming=M /'
+			comm -23 "$work/in" "$work/have.paths" | sed 's/^/incoming=A /'
+			cut -d' ' -f2- "$work/want" | sort | comm -23 "$work/have.paths" - | sed 's/^/incoming=D /'
 		fi
-		rm -f "$state/have" "$state/have.paths" "$state/here" "$state/want"
+		rm -f "$work/have" "$work/have.paths" "$work/here" "$work/want"
 		# "status local" stops here: quick, and without asking the bucket
 		[ "$1" = local ] && exit 0
 		(
 			use_read_key 2> /dev/null
-			get lock "$state/lock"
-			IFS='|' read -r owner since what < "$state/lock" || true
-			rm -f "$state/lock"
+			get lock "$work/lock"
+			IFS='|' read -r owner since what < "$work/lock" || true
+			rm -f "$work/lock"
 			if [ -n "$since" ] && [ $(($(date +%s) - since)) -lt $lock_seconds ]; then echo "lock=$owner is uploading $what"; fi
 			[ -f DLF.txt ] || exit 0
-			get "$(branch_key "$(current_branch)")" "$state/old"
-			if [ "$(list_id < "$state/old")" = "$(list_id < DLF.txt)" ]; then echo "uploaded=yes"; else echo "uploaded=no"; fi
-			rm -f "$state/old"
+			get "$(branch_key "$(current_branch)")" "$work/old"
+			if [ "$(list_id < "$work/old")" = "$(list_id < DLF.txt)" ]; then echo "uploaded=yes"; else echo "uploaded=no"; fi
+			rm -f "$work/old"
 		) 2> /dev/null || echo "bucket=unreachable"
 		;;
 	*)

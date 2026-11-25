@@ -1,6 +1,6 @@
 # DLF
 
-DLF (Derek's Large Files) keeps files that are too large for git, such as baked lighting, in a private S3 bucket
+DLF (Derek's Large Files) keeps files that are too large for git, such as baked lighting, video or builds, in a private S3 bucket
 (Cloudflare R2 by default) and brings them into a Unity project. Git still decides which version everyone has: each
 commit lists the files it needs.
 
@@ -10,8 +10,8 @@ commit lists the files it needs.
   it, and a read key.
 - `DLF.txt`, committed, lists the shared files: one line per file, with the hash of its content. A diff of it shows
   which files a commit changed.
-- **Download**, for everyone: makes the local files the ones `DLF.txt` lists. The Unity Editor does it by itself on
-  start, when it regains focus and before a build.
+- **Download**, for everyone: takes what is new in `DLF.txt`. The Unity Editor does it by itself on start, when it
+  regains focus and before a build.
 - **Upload**, on a machine with a write key: lists the shared files as they are now in `DLF.txt` and puts them in the
   bucket. You then commit `DLF.txt` with the changes that need the new files.
 
@@ -26,7 +26,7 @@ In the bucket, under the project's name:
 | `<project>/branches/<branch>` | the `DLF.txt` last uploaded for that branch |
 | `<project>/lock` | who is uploading right now |
 
-A file stays in the bucket while a list there names it, or a commit already pushed for the branch does. So branches
+A file stays in the bucket while a list there names it, or the newest pushed commit of any branch does. So branches
 with different files can all download, a new branch costs nothing until its files differ, nobody loses files between
 your upload and your push, and several projects can share one bucket.
 
@@ -40,6 +40,22 @@ Two settings change that, both in `Tools > DLF > Settings` under `Keys > Bucket`
 All of this is done by the shell scripts in `Hooks~`, which git runs with the shell it brings. The Unity code only
 runs them and shows the two windows. Git also matches the patterns, so they mean the same on every system:
 `*` and `?` stay within one folder or file name, `**` crosses folders.
+
+## Changes on two machines
+
+A download works file by file, the way git merges. Compared with what this machine last took:
+
+- a file that only changed in `DLF.txt` is downloaded, or removed;
+- a file that only changed on this machine is left alone;
+- a file that changed on both sides is a conflict. It is left as it is here and named, in the Console and in the
+  DLF window. Upload shares yours for everyone; Reset takes the listed one.
+
+So two people who change different files never get in each other's way: get the other's commit, and upload. An
+upload takes what is new in `DLF.txt` first, the same way, so it never lists someone else's file as the older one
+this machine still had.
+
+`DLF.txt` itself is merged by git, line by line. When both branches changed the same file git reports a conflict in
+it: keep one side's line for each file, then download.
 
 ## Install
 
@@ -62,38 +78,48 @@ write key gets no hooks.
 
 - **`Tools > DLF > DLF`** shows where things stand, the way a git client shows changes: the files that changed on this
   machine (added, modified, deleted) and the ones a download would bring, whether `DLF.txt` is committed, and whether
-  the bucket has it. Its buttons are every action: Download, Upload, Reset All, Reset Ticked, Unlock.
+  the bucket has it. Its buttons are every action: Download, Upload, Reset All, Reset Ticked, Unlock. Only a reset
+  ever replaces a file that was changed on this machine.
 - **`Tools > DLF > Settings`** holds the patterns, the bucket and the keys.
 
-A status line in the corner of the Scene view says in a few words whether the shared files are up to date, changed
-here or waiting to be downloaded. A click on it opens the DLF window.
+A status line in the corner of the Scene view names the next step, if there is one: files to download, a newer
+`DLF.txt` to pull (as of the last fetch), files to upload, `DLF.txt` to commit or to push. Otherwise it says all is
+good. A click on it opens the DLF window.
 
 ## Everyday use
 
-- **Change the shared files** (rebake): open the DLF window, press Upload, then commit `DLF.txt` together with the
-  changes that need the new files.
-- **Get someone else's change:** get their commit and switch to Unity. It downloads what changed.
+- **Change the shared files:** open the DLF window, press Upload, then commit `DLF.txt` together with the changes
+  that need the new files.
+- **Get someone else's change:** get their commit and switch to Unity. It downloads what changed, and leaves the
+  files you changed yourself alone.
 - **Not ready to share a change:** do nothing. Files that changed on your machine stay there until you upload.
-- **Throw a change away:** Reset All makes every shared file the one the checked-out commit lists, and puts `DLF.txt`
-  back. Reset Ticked does it for the files ticked in the window's list of changes.
+- **Throw a change away, or get a deleted file back:** Reset All makes every shared file the one `DLF.txt` lists.
+  Reset Ticked does it for the files ticked in the window's list of changes. To undo an upload that is not committed
+  yet, discard the change to `DLF.txt` in git first.
 
 ## Limits
 
 - By default a file is removed from the bucket once nothing lists it any more, so an older commit of a branch that
   has since changed its files cannot download them. Turn on **Keep Old Versions** to never remove anything.
-- Two people who change the shared files of the same branch at the same time: the second upload is refused, and that
-  change has to be redone on top of the first.
+- Two people who change the shared files of the same branch at the same time: the second upload is refused until
+  that machine has the first one's commit. Only a file both of them changed has to be redone or chosen.
 - While someone uploads, the bucket is locked and others wait. A lock left behind by an upload that died is ignored
   after an hour; the Unlock button of the DLF window clears it sooner.
-- The list of a branch that was deleted stays in the bucket, with its files, until it is removed there by hand.
+- The list of a branch that was merged and deleted is removed at the next upload. One whose files were uploaded but
+  never committed stays in the bucket, with its files, until it is removed there by hand.
+- An upload removes files nothing needs, going by the branches the uploading machine last fetched. A branch pushed
+  since then, that lists files which are in no list of the bucket, could lose them: upload again from that branch.
 - The hooks remind, they do not enforce: a commit can list files that were never uploaded.
 - Downloading is started by Unity. Without Unity, run `sh Hooks~/dlf download` from the top of the repository.
+- Git must be installed and on the PATH: the git inside GitHub Desktop or another client is not enough. Without it
+  the Console says so, and a build stops.
 - A shared file with a line break in its name is not supported.
 
 ## Requirements
 
 git, and what it brings or every system has: `sh`, `curl` 7.75 or newer, `gzip`, and `sha256sum` or `shasum`.
-On Windows, Git for Windows provides all of them.
+On Windows, Git for Windows provides all of them. The bucket must support conditional writes (`If-None-Match`), which
+the upload lock uses: Cloudflare R2 and Amazon S3 do.
 
 ## Where things are stored
 

@@ -17,9 +17,9 @@ while read -r ref sha remote_ref remote_sha; do
 	# Asking the bucket must never stop the push: when it cannot be reached, nothing is said
 	(
 		use_read_key
-		get "$(branch_key "${remote_ref#refs/heads/}")" "$state/old"
-		there=$(list_id < "$state/old")
-		rm -f "$state/old"
+		get "$(branch_key "${remote_ref#refs/heads/}")" "$work/old"
+		there=$(list_id < "$work/old")
+		rm -f "$work/old"
 		[ "$there" = "$id" ] || exit 2
 	) 2> /dev/null < /dev/null
 	if [ $? -eq 2 ]; then

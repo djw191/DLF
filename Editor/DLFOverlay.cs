@@ -61,12 +61,15 @@ internal static class DLFOverlay {
 				var changed = lines.Count(l => l.StartsWith("changed="));
 				var incoming = lines.Count(l => l.StartsWith("incoming="));
 				var canUpload = lines.Contains("key=write");
-				s_Ok = changed == 0 && incoming == 0 && !lines.Contains("committed=no");
+				// The most pressing step first: what to get, then what to share
 				s_Message = incoming > 0 ? $"{incoming} large files to download"
-					: changed > 0 ? $"{changed} large files changed here{(canUpload ? ", not uploaded" : "")}"
-					: lines.Contains("committed=no") ? "DLF.txt changed, not committed"
-					: lines.Any(l => l.StartsWith("files=")) ? "large files are up to date"
+					: lines.Contains("behind=yes") ? "a newer DLF.txt to pull"
+					: changed > 0 ? canUpload ? $"{changed} large files to upload" : $"{changed} large files changed or missing here"
+					: lines.Contains("committed=no") ? "DLF.txt to commit and push"
+					: lines.Contains("pushed=no") ? "DLF.txt to push"
+					: lines.Any(l => l.StartsWith("files=")) ? "large files: all good"
 					: "no large files shared yet";
+				s_Ok = !lines.Any(l => l.StartsWith("files=")) || s_Message == "large files: all good";
 			}
 			catch (Exception) {
 				s_Ok = false;

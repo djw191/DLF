@@ -22,6 +22,7 @@ public sealed class DLF : IPreprocessBuildWithReport {
 	private const string k_TriedKey = "DLF.Tried";
 	private const string k_HookStart = "# DLF begin: runs the DLF hook first (added by the DLF Unity package; delete down to \"DLF end\" to turn it off)";
 	private const string k_HookEnd = "# DLF end";
+	private const string k_NoGit = "DLF: git could not be run, so the shared large files cannot be downloaded. Install Git (git-scm.com; the git built into GitHub Desktop or another client is not enough), make sure it is on the PATH, and restart Unity.";
 
 	private static string s_Root, s_KeyPath;
 
@@ -34,10 +35,14 @@ public sealed class DLF : IPreprocessBuildWithReport {
 	public int callbackOrder => 0;
 
 	public void OnPreprocessBuild(BuildReport report) {
+		// Without git nothing here can tell which files the build needs: better no build than one without them
+		if (Git("--version").Length == 0) {
+			throw new BuildFailedException(k_NoGit);
+		}
 		if (!File.Exists(At(k_PointerName))) {
 			return;
 		}
-		var (code, _, messages) = Run("download", new[] { "auto" });
+		var (code, _, messages) = Run("download");
 		AssetDatabase.Refresh();
 		if (code != 0) {
 			throw new BuildFailedException(messages);
@@ -51,6 +56,10 @@ public sealed class DLF : IPreprocessBuildWithReport {
 		EditorApplication.focusChanged += OnFocusChanged;
 		if (!SessionState.GetBool(k_StartedKey, false)) {
 			SessionState.SetBool(k_StartedKey, true);
+			if (Git("--version").Length == 0) {
+				Debug.LogWarning(k_NoGit);
+				return;
+			}
 			InstallHooks();
 			QueueFetch();
 		}
@@ -75,7 +84,7 @@ public sealed class DLF : IPreprocessBuildWithReport {
 				return;
 			}
 			SessionState.SetString(k_TriedKey, pointer);
-			Report(Run("download", new[] { "auto" }));
+			Report(Run("download"));
 		};
 	}
 
@@ -147,7 +156,7 @@ public sealed class DLF : IPreprocessBuildWithReport {
 			return (process.ExitCode, output.ToString(), messages.ToString().Trim());
 		}
 		catch (Exception e) {
-			return (1, "", $"DLF: could not run git ({e.Message}).");
+			return (1, "", $"{k_NoGit} ({e.Message})");
 		}
 		finally {
 			EditorUtility.ClearProgressBar();

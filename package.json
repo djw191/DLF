@@ -1,8 +1,8 @@
 {
   "name": "com.derekwoodard.dlf",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "displayName": "DLF",
-  "description": "DLF (Derek's Large Files) keeps files that are too large for git, such as baked lighting, in a private S3 bucket (Cloudflare R2). Git hooks publish them on push and the Editor fetches the set each commit names.",
+  "description": "DLF (Derek's Large Files) keeps files that are too large for git, such as baked lighting, in a private S3 bucket (Cloudflare R2). DLF.txt, committed, lists the files each commit needs; the Editor downloads them and a window uploads new ones.",
   "unity": "2021.3",
   "author": {
     "name": "Derek Woodard"
