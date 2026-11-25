@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Runtime.CompilerServices;
 using System.Text;
 using UnityEditor;
 using UnityEditor.Build;
@@ -174,9 +173,13 @@ public sealed class DLF : IPreprocessBuildWithReport {
 		}
 	}
 
-	// The folder of the shell scripts, next to this file's folder wherever the package is installed
-	private static string Scripts([CallerFilePath] string file = "") {
-		return Path.GetFullPath(Path.Combine(Path.GetDirectoryName(file), "..", "Hooks~")).Replace('\\', '/');
+	// The folder of the shell scripts. Asked for each time: a path fixed when the code was compiled goes stale when the
+	// package moves (a new version in Unity's cache, a renamed project folder) without being compiled again
+	private static string Scripts() {
+		var package = UnityEditor.PackageManager.PackageInfo.FindForAssembly(typeof(DLF).Assembly);
+		// Installed as a package, or copied into Assets with the Hooks~ folder next to the Editor folder
+		var folder = package != null ? package.resolvedPath : Path.GetDirectoryName(Path.GetDirectoryName(UnityEditor.Compilation.CompilationPipeline.GetAssemblyDefinitionFilePathFromAssemblyName("DLF.Editor")));
+		return Path.GetFullPath(Path.Combine(folder, "Hooks~")).Replace('\\', '/');
 	}
 
 	// The output of a git command, empty when git is missing or this is not a repository
