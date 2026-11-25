@@ -7,9 +7,13 @@
 #   dlf unlock           clears a lock an upload left behind
 #   dlf status           prints what the DLF window shows: this machine's files, DLF.txt, and the bucket
 #   dlf keypath          prints where this machine's write key is kept
+#   dlf install          on a machine with a write key, puts DLF's reminders in the git hooks (Unity runs it on every reload)
+#   dlf ignore           lists the patterns of DLF.cfg in .gitignore
+#   dlf release          lets go of what a run that was stopped from outside held
 . "$(dirname "$0")/dlf.sh"
 command=$1
 [ $# -gt 0 ] && shift
+case "$command" in download | upload | reset) hold ;; esac
 case "$command" in
 	keypath)
 		printf '%s\n' "$keys"
@@ -35,6 +39,26 @@ case "$command" in
 			sync "$@"
 		fi
 		report_conflicts
+		;;
+	install)
+		install_hooks "$(dirname "$0")"
+		;;
+	ignore)
+		update_ignore
+		;;
+	release)
+		# The busy mark, when the run that made it is gone, and the bucket's lock when it is this machine's
+		pid=$(cat "$state/busy/pid" 2> /dev/null)
+		if [ -z "$pid" ] || ! kill -0 "$pid" 2> /dev/null; then
+			rm -rf "$state/busy"
+		fi
+		[ -f "$keys" ] || exit 0
+		use_write_key
+		get lock "$work/lock"
+		IFS='|' read -r owner since what < "$work/lock" || true
+		if [ "$owner" = "$me" ]; then
+			r2 DELETE lock > /dev/null || fail "could not clear the lock."
+		fi
 		;;
 	unlock)
 		use_write_key
@@ -93,6 +117,6 @@ case "$command" in
 		) 2> /dev/null || echo "bucket=unreachable"
 		;;
 	*)
-		fail "unknown command '$command'. Use download, upload, reset, unlock, status or keypath."
+		fail "unknown command '$command'. Use download, upload, reset, unlock, status, keypath, install, ignore or release."
 		;;
 esac

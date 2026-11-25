@@ -1,8 +1,10 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading.Tasks;
 using UnityEditor;
 using UnityEditor.Build;
 using UnityEditor.Build.Reporting;
@@ -10,27 +12,38 @@ using UnityEngine;
 
 /// <summary>
 /// The Unity side of DLF (Derek's Large Files), which keeps files that are too large for git in an S3 bucket.
-/// All of DLF's logic is in the shell scripts of the Hooks~ folder: this class only runs them. It fetches the set of
-/// files the checked-out commit lists (on start, when the Editor regains focus and before a build), and on a machine
-/// with a write key adds DLF's hooks to the repository's git hooks. Everything a person does goes through DLFWindow.
-/// See README.md.
+/// All of DLF's logic is in the shell scripts of the Hooks~ folder: this class only runs them, in the background where it
+/// can (Unity's Background Tasks show how far a run is and can cancel it). It downloads what DLF.txt lists on start, when
+/// the Editor regains focus and before a build, and on every reload has the scripts put DLF's reminders in the git hooks
+/// of a machine with a write key. Everything a person does goes through DLFWindow. See README.md.
 /// </summary>
 public sealed class DLF : IPreprocessBuildWithReport {
 	internal const string k_ConfigName = "DLF.cfg";
 	private const string k_PointerName = "DLF.txt";
 	private const string k_StartedKey = "DLF.Started";
 	private const string k_TriedKey = "DLF.Tried";
-	private const string k_HookStart = "# DLF begin: runs the DLF hook first (added by the DLF Unity package; delete down to \"DLF end\" to turn it off)";
-	private const string k_HookEnd = "# DLF end";
 	private const string k_NoGit = "DLF: git could not be run, so the shared large files cannot be downloaded. Install Git (git-scm.com; the git built into GitHub Desktop or another client is not enough), make sure it is on the PATH, and restart Unity.";
 
 	private static string s_Root, s_KeyPath;
+	// What the background runs hand back to the main thread, the only one where Unity's API may be used
+	private static readonly ConcurrentQueue<Action> s_MainThread = new();
+
+	// A running command of the dlf script: its process, and what it printed so far
+	private sealed class Job {
+		public System.Diagnostics.Process process;
+		public readonly StringBuilder output = new();
+		public readonly StringBuilder messages = new();
+		public volatile string progress = "";
+	}
 
 	// Where this machine's write key is kept, as the scripts decide it (it depends on the bucket)
 	internal static string keyPath {
 		get => s_KeyPath ??= Run("keypath").output.Trim();
 		set => s_KeyPath = value;
 	}
+
+	// True while a download, upload, reset or unlock runs in the background: one at a time
+	internal static bool busy { get; private set; }
 
 	public int callbackOrder => 0;
 
@@ -51,17 +64,36 @@ public sealed class DLF : IPreprocessBuildWithReport {
 
 	[InitializeOnLoadMethod]
 	private static void Start() {
+		EditorApplication.update -= Pump;
+		EditorApplication.update += Pump;
 		// A pull happens outside the Editor: look again whenever it comes back to the front
 		EditorApplication.focusChanged -= OnFocusChanged;
 		EditorApplication.focusChanged += OnFocusChanged;
-		if (!SessionState.GetBool(k_StartedKey, false)) {
-			SessionState.SetBool(k_StartedKey, true);
-			if (Git("--version").Length == 0) {
-				Debug.LogWarning(k_NoGit);
-				return;
+		var first = !SessionState.GetBool(k_StartedKey, false);
+		SessionState.SetBool(k_StartedKey, true);
+		if (first && Git("--version").Length == 0) {
+			Debug.LogWarning(k_NoGit);
+			return;
+		}
+		// On every reload, so that the copies of the hook scripts follow an update of the package; its notes once a session
+		RunInBackground("install", null, result => {
+			if (first && result.messages.Length > 0) {
+				Debug.LogWarning(result.messages);
 			}
-			InstallHooks();
+		});
+		if (first) {
 			QueueFetch();
+		}
+	}
+
+	private static void Pump() {
+		while (s_MainThread.TryDequeue(out var action)) {
+			try {
+				action();
+			}
+			catch (Exception e) {
+				Debug.LogException(e);
+			}
 		}
 	}
 
@@ -83,13 +115,16 @@ public sealed class DLF : IPreprocessBuildWithReport {
 			if (EditorApplication.isPlayingOrWillChangePlaymode) {
 				return;
 			}
-			SessionState.SetString(k_TriedKey, pointer);
-			Report(Run("download"));
+			// While another run goes, the next focus tries again
+			if (RunInBackground("download", null, Report, "Downloading the shared large files")) {
+				SessionState.SetString(k_TriedKey, pointer);
+			}
 		};
 	}
 
 	private static void Report((int code, string output, string messages) result) {
 		AssetDatabase.Refresh();
+		DLFOverlay.Refresh();
 		if (result.code != 0) {
 			Debug.LogWarning(result.messages.Length > 0 ? result.messages : "DLF: stopped.");
 		}
@@ -107,53 +142,76 @@ public sealed class DLF : IPreprocessBuildWithReport {
 		return line.ToString();
 	}
 
-	// Runs a command of the dlf script (Hooks~/dlf) and waits for it, with a progress bar that can cancel it.
-	// Git runs the script with the shell it brings, from the top of the repository: no shell has to be installed or found
-	internal static (int code, string output, string messages) Run(string command, IEnumerable<string> arguments = null) {
-		var line = Arguments(command, arguments);
-		var output = new StringBuilder();
-		var messages = new StringBuilder();
-		var progress = "";
-		try {
-			using var process = new System.Diagnostics.Process {
-				StartInfo = new System.Diagnostics.ProcessStartInfo("git", line.ToString()) {
+	// Starts a command of the dlf script (Hooks~/dlf). Git runs the script with the shell it brings, from the top of the
+	// repository: no shell has to be installed or found
+	private static Job Launch(string line) {
+		var job = new Job {
+			process = new System.Diagnostics.Process {
+				StartInfo = new System.Diagnostics.ProcessStartInfo("git", line) {
 					RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true
 				}
-			};
-			// The script prints "PROGRESS done total what" lines; everything else is its result
-			process.OutputDataReceived += (_, e) => {
-				if (e.Data != null && e.Data.StartsWith("PROGRESS ")) {
-					progress = e.Data;
-				}
-				else if (e.Data != null) {
-					lock (output) {
-						output.AppendLine(e.Data);
-					}
-				}
-			};
-			process.ErrorDataReceived += (_, e) => {
-				if (e.Data != null) {
-					lock (messages) {
-						messages.AppendLine(e.Data);
-					}
-				}
-			};
-			process.Start();
-			process.BeginOutputReadLine();
-			process.BeginErrorReadLine();
+			}
+		};
+		// The script prints "PROGRESS done total what" lines; everything else is its result
+		job.process.OutputDataReceived += (_, e) => {
+			if (e.Data == null) {
+				return;
+			}
+			if (e.Data.StartsWith("PROGRESS ")) {
+				job.progress = e.Data;
+				return;
+			}
+			lock (job.output) {
+				job.output.AppendLine(e.Data);
+			}
+		};
+		job.process.ErrorDataReceived += (_, e) => {
+			if (e.Data == null) {
+				return;
+			}
+			lock (job.messages) {
+				job.messages.AppendLine(e.Data);
+			}
+		};
+		job.process.Start();
+		job.process.BeginOutputReadLine();
+		job.process.BeginErrorReadLine();
+		return job;
+	}
+
+	// Waits for the end of a command, and takes what it printed
+	private static (int code, string output, string messages) Finish(Job job) {
+		job.process.WaitForExit();
+		var code = job.process.ExitCode;
+		job.process.Dispose();
+		lock (job.output) {
+			lock (job.messages) {
+				return (code, job.output.ToString(), job.messages.ToString().Trim());
+			}
+		}
+	}
+
+	// A "PROGRESS done total what" line: how far, and at what
+	private static (int done, int total, string text) Parse(string progress) {
+		var parts = progress.Split(new[] { ' ' }, 4);
+		return parts.Length == 4 && int.TryParse(parts[1], out var done) && int.TryParse(parts[2], out var total) ? (done, total, parts[3]) : (0, 0, "Working on the shared large files");
+	}
+
+	// Runs a command and waits for it, with a progress bar that can cancel it: for what has to be done before going on
+	internal static (int code, string output, string messages) Run(string command, IEnumerable<string> arguments = null) {
+		try {
+			var job = Launch(Arguments(command, arguments));
 			var shown = false;
-			while (!process.WaitForExit(shown ? 100 : 1000)) {
+			while (!job.process.WaitForExit(shown ? 100 : 1000)) {
 				// Only something that takes a while gets a progress bar
 				shown = true;
-				var parts = progress.Split(new[] { ' ' }, 4);
-				var fraction = parts.Length == 4 && float.TryParse(parts[1], out var done) && float.TryParse(parts[2], out var total) && total > 0 ? done / total : 0;
-				if (EditorUtility.DisplayCancelableProgressBar("DLF", parts.Length == 4 ? parts[3] : "Working on the shared large files", fraction)) {
-					process.Kill();
+				var (done, total, text) = Parse(job.progress);
+				if (EditorUtility.DisplayCancelableProgressBar("DLF", text, total > 0 ? (float)done / total : 0)) {
+					Stop(job.process);
 					return (1, "", "DLF: cancelled.");
 				}
 			}
-			process.WaitForExit();
-			return (process.ExitCode, output.ToString(), messages.ToString().Trim());
+			return Finish(job);
 		}
 		catch (Exception e) {
 			return (1, "", $"{k_NoGit} ({e.Message})");
@@ -161,6 +219,90 @@ public sealed class DLF : IPreprocessBuildWithReport {
 		finally {
 			EditorUtility.ClearProgressBar();
 		}
+	}
+
+	// Runs a command in the background and hands its result to then, on the main thread. With a title it shows in Unity's
+	// Background Tasks, where it can be cancelled, and it only starts when no other such run goes: false when one does
+	internal static bool RunInBackground(string command, IEnumerable<string> arguments = null, Action<(int code, string output, string messages)> then = null, string title = null) {
+		if (title != null && busy) {
+			return false;
+		}
+		var line = Arguments(command, arguments);
+		var id = -1;
+		Job job = null;
+		if (title != null) {
+			busy = true;
+			id = Progress.Start("DLF", title);
+			Progress.RegisterCancelCallback(id, () => {
+				var running = job;
+				if (running != null) {
+					Stop(running.process);
+				}
+				return true;
+			});
+		}
+		Task.Run(() => {
+			(int code, string output, string messages) result;
+			try {
+				job = Launch(line);
+				var shown = "";
+				while (!job.process.WaitForExit(200)) {
+					var progress = job.progress;
+					if (id < 0 || progress == shown) {
+						continue;
+					}
+					shown = progress;
+					var (done, total, text) = Parse(progress);
+					s_MainThread.Enqueue(() => {
+						if (!Progress.Exists(id)) {
+							return;
+						}
+						if (total > 0) {
+							Progress.Report(id, done, total, text);
+						}
+						else {
+							Progress.SetDescription(id, text);
+						}
+					});
+				}
+				result = Finish(job);
+			}
+			catch (Exception e) {
+				result = (1, "", $"{k_NoGit} ({e.Message})");
+			}
+			s_MainThread.Enqueue(() => {
+				if (id >= 0) {
+					busy = false;
+					if (Progress.Exists(id) && Progress.GetStatus(id) == Progress.Status.Running) {
+						Progress.Finish(id, result.code == 0 ? Progress.Status.Succeeded : Progress.Status.Failed);
+					}
+				}
+				then?.Invoke(result);
+			});
+		});
+		return true;
+	}
+
+	// Stops a run with everything it started (killing git alone leaves its shell going on), then lets go of what it held:
+	// the busy mark, and the bucket's lock when it was uploading
+	private static void Stop(System.Diagnostics.Process process) {
+		try {
+			if (!process.HasExited) {
+				var kill = Application.platform == RuntimePlatform.WindowsEditor
+					? new System.Diagnostics.ProcessStartInfo("taskkill", $"/T /F /PID {process.Id}")
+					: new System.Diagnostics.ProcessStartInfo("pkill", $"-TERM -P {process.Id}");
+				kill.UseShellExecute = false;
+				kill.CreateNoWindow = true;
+				System.Diagnostics.Process.Start(kill)?.WaitForExit();
+				if (!process.HasExited) {
+					process.Kill();
+				}
+			}
+		}
+		catch (Exception) {
+			// It ended on its own meanwhile
+		}
+		RunInBackground("release");
 	}
 
 	// The folder of the shell scripts. Asked for each time: a path fixed when the code was compiled goes stale when the
@@ -202,46 +344,5 @@ public sealed class DLF : IPreprocessBuildWithReport {
 	internal static List<string> Matches(IEnumerable<string> patterns) {
 		var specs = string.Concat(patterns.Select(p => $" \":(top,glob){p.Replace("\"", "\\\"")}\""));
 		return specs.Length == 0 ? new List<string>() : Git($"ls-files --others --full-name -z --{specs}").Split(new[] { '\0' }, StringSplitOptions.RemoveEmptyEntries).ToList();
-	}
-
-	// On a machine with a write key, makes git run the DLF hooks without taking over the repository's hooks: other hooks
-	// (Git LFS and the like) keep working. The scripts are copied into the git folder, a path that survives package updates
-	// and is the same for every checkout of the repository, and a marked block in the normal pre-commit and pre-push hooks
-	// calls them first. A machine that only fetches needs no hooks and gets none
-	internal static void InstallHooks() {
-		var common = Git("rev-parse --git-common-dir");
-		if (common.Length == 0 || !File.Exists(keyPath)) {
-			return;
-		}
-		common = Path.GetFullPath(common);
-		Directory.CreateDirectory(Path.Combine(common, "dlf-hooks"));
-		foreach (var script in Directory.GetFiles(Scripts())) {
-			File.Copy(script, Path.Combine(common, "dlf-hooks", Path.GetFileName(script)), true);
-		}
-		if (Git("config core.hooksPath").Length > 0) {
-			Debug.LogWarning("DLF: this repository keeps its git hooks in another folder (core.hooksPath), so DLF did not add itself. To publish from this machine, call .git/dlf-hooks/pre-commit and .git/dlf-hooks/pre-push from those hooks.");
-			return;
-		}
-		Directory.CreateDirectory(Path.Combine(common, "hooks"));
-		foreach (var hook in new[] { "pre-commit", "pre-push" }) {
-			var path = Path.Combine(common, "hooks", hook);
-			var text = File.Exists(path) ? File.ReadAllText(path).Replace("\r\n", "\n") : "#!/bin/sh\n";
-			if (text.Contains(k_HookStart)) {
-				continue;
-			}
-			if (!text.StartsWith("#!") || !text.Split('\n')[0].EndsWith("sh")) {
-				Debug.LogWarning($"DLF: the git hook {path} is not a shell script, so DLF did not add itself to it. To publish from this machine, call .git/dlf-hooks/{hook} from it.");
-				continue;
-			}
-			// pre-push gets the pushed refs on its input: they are read once and handed to both the DLF hook and the rest of the script
-			var call = hook == "pre-push"
-				? "dlf_refs=$(cat)\nprintf '%s\\n' \"$dlf_refs\" | sh \"$(git rev-parse --git-common-dir)/dlf-hooks/pre-push\" \"$@\" || exit 1\nexec <<DLF_REFS\n$dlf_refs\nDLF_REFS\n"
-				: "sh \"$(git rev-parse --git-common-dir)/dlf-hooks/pre-commit\" \"$@\" || exit 1\n";
-			var first = text.IndexOf('\n') < 0 ? text.Length : text.IndexOf('\n') + 1;
-			File.WriteAllText(path, text.Substring(0, first).TrimEnd('\n') + $"\n{k_HookStart}\n{call}{k_HookEnd}\n" + text.Substring(first));
-			if (Application.platform != RuntimePlatform.WindowsEditor) {
-				System.Diagnostics.Process.Start("chmod", $"+x \"{path}\"")?.WaitForExit();
-			}
-		}
 	}
 }

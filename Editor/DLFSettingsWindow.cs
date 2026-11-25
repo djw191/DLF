@@ -10,8 +10,6 @@ using UnityEngine;
 /// write key, stored outside the repository. Shows the files the patterns match, and keeps them ignored by git.
 /// </summary>
 public sealed class DLFSettingsWindow : EditorWindow {
-	private const string k_IgnoreStart = "# DLF: shared through the bucket instead of git (written by Tools/DLF/Settings, edit the patterns there)";
-	private const string k_IgnoreEnd = "# DLF end";
 	private const float k_RowHeight = 18;
 	private const float k_ListHeight = 290;
 	// The lines of DLF.cfg this window writes; any other line in it is kept as it is
@@ -152,17 +150,8 @@ public sealed class DLFSettingsWindow : EditorWindow {
 		lines.Add($"readSecretAccessKey={m_ReadKeySecret}");
 		File.WriteAllText(config, string.Concat(kept.Concat(lines).Concat(patterns.Select(p => $"pattern={p}")).Select(l => l + "\n")));
 
-		// The block between the two marker lines is replaced; the rest of .gitignore, and its line endings, are left as they are
-		var ignorePath = DLF.At(".gitignore");
-		var original = File.Exists(ignorePath) ? File.ReadAllText(ignorePath) : "";
-		var ignore = original.Replace("\r\n", "\n");
-		var start = ignore.IndexOf(k_IgnoreStart, StringComparison.Ordinal);
-		var end = ignore.IndexOf(k_IgnoreEnd, StringComparison.Ordinal);
-		if (start >= 0 && end > start) {
-			ignore = ignore.Remove(start, end + k_IgnoreEnd.Length - start);
-		}
-		ignore = $"{ignore.TrimEnd('\n')}\n\n{k_IgnoreStart}\n{string.Concat(patterns.Select(p => $"/{p}\n"))}{k_IgnoreEnd}\n";
-		File.WriteAllText(ignorePath, original.Contains("\r\n") ? ignore.Replace("\n", "\r\n") : ignore);
+		// The scripts list the patterns in .gitignore too, so that these files stay out of git
+		Note(DLF.Run("ignore"));
 
 		// The key's place depends on the bucket, which may just have changed
 		DLF.keyPath = null;
@@ -175,7 +164,14 @@ public sealed class DLFSettingsWindow : EditorWindow {
 		else {
 			Directory.CreateDirectory(Path.GetDirectoryName(DLF.keyPath));
 			File.WriteAllText(DLF.keyPath, $"accessKeyId={m_WriteKeyId}\nsecretAccessKey={m_WriteKeySecret}\n");
-			DLF.InstallHooks();
+			// With a write key, the reminders in the git hooks
+			Note(DLF.Run("install"));
+		}
+	}
+
+	private static void Note((int code, string output, string messages) result) {
+		if (result.messages.Length > 0) {
+			Debug.LogWarning(result.messages);
 		}
 	}
 }

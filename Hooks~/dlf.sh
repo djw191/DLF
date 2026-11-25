@@ -41,7 +41,15 @@ keys="${APPDATA:-${XDG_CONFIG_HOME:-$HOME/.config}}/DLF/$bucket.cfg"
 state="$(git rev-parse --git-dir)/dlf"
 work="$state/work.$$"
 mkdir -p "$work"
-trap 'rm -rf "$work"' EXIT
+# What a command holds is let go however it ends: the bucket's lock while it uploads, this machine's busy mark
+locked=
+held=
+cleanup() {
+	[ -z "$locked" ] || r2 DELETE lock > /dev/null 2>&1
+	[ -z "$held" ] || rm -rf "$state/busy"
+	rm -rf "$work"
+}
+trap cleanup EXIT
 # What a command that was killed left behind
 find "$state" -maxdepth 1 -name 'work.*' -mmin +1440 -exec rm -rf {} + 2> /dev/null
 # Who holds the lock: the same person on another machine is someone else
@@ -75,14 +83,26 @@ seen() {
 	rm -f "$work/seen.names"
 }
 
-# Prints the list of the shared files as they are now, "hash path" per line. Hashing gigabytes takes a while
+# Prints the list of the shared files as they are now, "hash path" per line, in the order of their paths. Hashing
+# gigabytes takes a while, so only the files whose size or time changed since the last list are read: the others
+# keep the hash that list has for them
 local_list() {
 	echo "DLF: checking the shared large files..." >&2
 	# What is remembered for this list is taken before the hashing, so that a file written during it counts as changed
 	seen > "$work/seen"
-	shared_files > "$work/names"
-	[ -s "$work/names" ] && xargs -0 $hasher < "$work/names" | sed 's/^\([0-9a-f]*\) [ *]/\1 /'
-	rm -f "$work/names"
+	: > "$work/known"
+	if [ -f "$state/seen" ] && [ -f "$state/synced" ] && git cat-file -e "$(cat "$state/synced")" 2> /dev/null; then
+		sort "$state/seen" > "$work/before"
+		sort "$work/seen" | comm -12 "$work/before" - | cut -d/ -f3- > "$work/same"
+		git cat-file blob "$(cat "$state/synced")" | lines_at "$work/same" - 1 > "$work/known"
+	fi
+	cut -d' ' -f2- "$work/known" | sort > "$work/same"
+	shared_files | tr '\0' '\n' | sort | comm -23 - "$work/same" | tr '\n' '\0' > "$work/names"
+	{
+		cat "$work/known"
+		[ -s "$work/names" ] && xargs -0 $hasher < "$work/names" | sed 's/^\([0-9a-f]*\) [ *]/\1 /'
+	} | sort -k 2
+	rm -f "$work/known" "$work/before" "$work/same" "$work/names"
 }
 
 # The git id of a list read from the input, with line endings as git stores them
@@ -99,7 +119,9 @@ unchanged() {
 # Notes that the shared files are now the list on the input. The list is stored in git's own object store, where
 # its content can be read back later
 mark_synced() {
-	tr -d '\r' | git hash-object -w --stdin > "$state/synced"
+	# Written aside and moved in place: a status check reading it meanwhile never sees half of it
+	tr -d '\r' | git hash-object -w --stdin > "$work/synced"
+	mv "$work/synced" "$state/synced"
 	if [ -f "$work/seen" ]; then
 		mv "$work/seen" "$state/seen"
 	else
@@ -137,8 +159,9 @@ use_read_key() {
 	fi
 }
 
-# signed [curl options] URL: a signed request
-signed() { curl -sS -f -K "$work/key" --aws-sigv4 "aws:amz:$region:s3" "$@"; }
+# signed [curl options] URL: a signed request. A connection that cannot be made in 20 seconds, or that moves less than
+# 1 KB a second for a minute, is given up: a stalled network must never hang a push or the Editor
+signed() { curl -sS -f -K "$work/key" --aws-sigv4 "aws:amz:$region:s3" --connect-timeout 20 --speed-limit 1024 --speed-time 60 "$@"; }
 
 # r2 METHOD NAME [curl options]: a signed request for one object of the project
 r2() {
@@ -206,6 +229,22 @@ check_lock() {
 	fi
 }
 
+# Only one download, upload or reset at a time on this machine: they write the same files and markers. The mark of a
+# run that was killed is taken over
+hold() {
+	if ! mkdir "$state/busy" 2> /dev/null; then
+		pid=$(cat "$state/busy/pid" 2> /dev/null)
+		# A mark without a number is one another run made a moment ago
+		if { [ -n "$pid" ] && kill -0 "$pid" 2> /dev/null; } || { [ -z "$pid" ] && [ -z "$(find "$state/busy" -maxdepth 0 -mmin +1 2> /dev/null)" ]; }; then
+			fail "DLF is already downloading or uploading on this machine. Try again when it is done."
+		fi
+		rm -rf "$state/busy"
+		mkdir "$state/busy" 2> /dev/null || fail "DLF is already downloading or uploading on this machine. Try again when it is done."
+	fi
+	held=1
+	echo $$ > "$state/busy/pid"
+}
+
 # True when the path is among the selected ones: the path itself, its .meta, or anything in a selected folder
 selected() {
 	path=$1
@@ -246,7 +285,14 @@ apply() {
 			done=$((done + 1))
 			echo "PROGRESS $done $total $path"
 			case "$path" in */*) [ "${path%/*}" = "$folder" ] || { folder=${path%/*}; mkdir -p "$folder"; } ;; esac
-			cp "$work/in/$hash" "$path"
+			# Moved, not copied, so that a download needs no room for a second copy. A content listed under two names
+			# is copied from where the first one went
+			if [ -f "$work/in/$hash" ]; then
+				mv "$work/in/$hash" "$path" || fail "could not write $path. Is it open in another program?"
+				printf '%s %s\n' "$hash" "$path" >> "$work/placed"
+			else
+				cp "$(grep -m 1 "^$hash " "$work/placed" | cut -d' ' -f2-)" "$path" || fail "could not write $path. Is it open in another program?"
+			fi
 		done < "$work/needed"
 	fi
 	# Only now that every file it needs is in place, the files the list does not name are removed
@@ -254,7 +300,7 @@ apply() {
 	cut -d' ' -f2- "$work/have" | sort | comm -23 - "$work/wanted.paths" | while IFS= read -r path; do
 		rm -f "$path"
 	done
-	rm -rf "$work/in" "$work/get" "$work/wanted.paths" "$work/needed" "$work/seen"
+	rm -rf "$work/in" "$work/get" "$work/placed" "$work/wanted.paths" "$work/needed" "$work/seen"
 }
 
 # differing A B: the paths whose line is not the same in the sorted lists A and B
@@ -271,11 +317,18 @@ lines_at() { awk -v wanted="$3" 'FILENAME == ARGV[1] { named[$0]; next } ((subst
 # listed ones too
 sync() {
 	tr -d '\r' < DLF.txt | sort > "$work/theirs"
-	# The list must never reach outside the repository
+	# The list must never reach outside the repository, into git's own folder, or over a file git keeps
 	while read -r hash path; do
-		case "$hash" in *[!0-9a-f]*) fail "DLF.txt is not a list of files. If git left a merge conflict in it, settle that first: keep one side's line for each file." ;; esac
+		case "$hash" in *[!0-9a-f]*) hash= ;; esac
+		[ ${#hash} -eq 64 ] || fail "DLF.txt is not a list of files. If git left a merge conflict in it, settle that first: keep one side's line for each file."
 		case "$path" in "" | /* | ?:* | ../* | */../* | */.. | *\\*) fail "the list of shared files names a path outside the project: $path" ;; esac
+		# Whatever the case of its name: Windows does not tell .GIT from .git
+		case "$path" in [.][Gg][Ii][Tt]/* | */[.][Gg][Ii][Tt]/*) fail "the list of shared files names a file in git's own folder: $path" ;; esac
 	done < "$work/theirs"
+	if [ -s "$work/theirs" ]; then
+		tracked=$(cut -d' ' -f2- "$work/theirs" | tr '\n' '\0' | xargs -0 git --literal-pathspecs ls-files -- | head -n 1)
+		[ -z "$tracked" ] || fail "the list of shared files names a file that git keeps: $tracked. Take it out of git (git rm --cached) or out of DLF.txt."
+	fi
 	if [ -f "$state/synced" ] && git cat-file -e "$(cat "$state/synced")" 2> /dev/null; then
 		git cat-file blob "$(cat "$state/synced")" | sort > "$work/base"
 	else
@@ -362,7 +415,7 @@ upload() {
 	old_id=$(list_id < "$work/old")
 	# What is there for the branch must be a list this checkout knows: one it uploaded itself, or one in the history
 	# of the checked-out commit. Otherwise someone else's newer files would be replaced. With one set for all branches
-# there is nothing to protect: the set is whatever was uploaded last
+	# there is nothing to protect: the set is whatever was uploaded last
 	if [ "$one_set" != true ] && [ -s "$work/old" ] && [ "$old_id" != "$id" ] && [ "$old_id" != "$(cat "$state/uploaded" 2> /dev/null)" ]; then
 		known=$(git rev-list HEAD -- DLF.txt 2> /dev/null | while read -r past; do git rev-parse -q --verify "$past:DLF.txt"; done | grep -c "^$old_id$")
 		[ "$known" -gt 0 ] || fail "not uploaded: someone else uploaded other files for $branch. Get their commit and upload again: your changed files are kept, theirs are downloaded."
@@ -386,7 +439,7 @@ upload() {
 	# The bucket only takes this write while there is no lock: of two uploaders starting together, one is refused
 	put lock "$work/lock" -H 'If-None-Match: *' 2> /dev/null || fail "not uploaded: someone else started uploading at the same moment, or the bucket could not be reached. Try again."
 	rm -f "$work/lock"
-	trap 'r2 DELETE lock > /dev/null 2>&1; rm -rf "$work"' EXIT
+	locked=1
 	echo "DLF: uploading the large files of $branch..." >&2
 	names files/ | sed 's|^files/||' | sort > "$work/there"
 	total=$(wc -l < "$work/new" | tr -d ' ')
@@ -437,7 +490,92 @@ upload() {
 		done
 	fi
 	r2 DELETE lock > /dev/null
+	locked=
 	rm -f "$work/old" "$work/new" "$work/other" "$work/lists" "$work/there" "$work/kept" "$work/tmp"
-	trap 'rm -rf "$work"' EXIT
 	echo "DLF: uploaded. Commit DLF.txt with the changes that need these files." >&2
+}
+
+# The marked block that has git run a DLF hook first, ahead of whatever the hook file already does. The DLF hooks only
+# remind, so the block never stops a commit or a push, not even when the hook script is gone
+hook_start='# DLF begin: runs the DLF hook first (added by the DLF Unity package; delete down to "DLF end" to turn it off)'
+hook_end='# DLF end'
+
+hook_call() {
+	if [ "$1" = pre-push ]; then
+		# pre-push gets the pushed refs on its input: they are read once and handed to both the DLF hook and the rest
+		cat << 'EOF'
+dlf_refs=$(cat)
+dlf_hook="$(git rev-parse --git-common-dir)/dlf-hooks/pre-push"
+[ ! -f "$dlf_hook" ] || printf '%s\n' "$dlf_refs" | sh "$dlf_hook" "$@"
+exec <<DLF_REFS
+$dlf_refs
+DLF_REFS
+EOF
+	else
+		cat << 'EOF'
+dlf_hook="$(git rev-parse --git-common-dir)/dlf-hooks/pre-commit"
+[ ! -f "$dlf_hook" ] || sh "$dlf_hook" "$@"
+EOF
+	fi
+}
+
+# install_hooks SCRIPTS: on a machine with a write key, copies the scripts to the git folder, where they survive package
+# updates and serve every checkout of the repository, and puts the marked block in its pre-commit and pre-push hooks.
+# Hooks already there (Git LFS and the like) keep working; an older block is replaced. A machine that only downloads
+# needs no reminders and gets none
+install_hooks() {
+	[ -f "$keys" ] || return 0
+	common=$(git rev-parse --git-common-dir) || return 0
+	mkdir -p "$common/dlf-hooks" "$common/hooks"
+	[ "$(cd "$1" && pwd)" = "$(cd "$common/dlf-hooks" && pwd)" ] || cp "$1"/* "$common/dlf-hooks/"
+	if [ -n "$(git config core.hooksPath)" ]; then
+		echo "DLF: this repository keeps its git hooks in another folder (core.hooksPath), so DLF did not add itself. To be reminded before commits and pushes, call .git/dlf-hooks/pre-commit and .git/dlf-hooks/pre-push from those hooks." >&2
+		return 0
+	fi
+	for hook in pre-commit pre-push; do
+		file="$common/hooks/$hook"
+		[ -f "$file" ] || printf '#!/bin/sh\n' > "$file"
+		case "$(head -n 1 "$file" | tr -d '\r')" in
+			'#!'*sh) ;;
+			*)
+				echo "DLF: the git hook $file is not a shell script, so DLF did not add itself to it. To be reminded, call .git/dlf-hooks/$hook from it." >&2
+				continue
+				;;
+		esac
+		{
+			head -n 1 "$file" | tr -d '\r'
+			echo "$hook_start"
+			hook_call "$hook"
+			echo "$hook_end"
+			tail -n +2 "$file" | tr -d '\r' | awk -v s="$hook_start" -v e="$hook_end" '$0 == s { skip = 1 } !skip { print } $0 == e { skip = 0 }'
+		} > "$work/hook"
+		cmp -s "$work/hook" "$file" || cat "$work/hook" > "$file"
+		chmod +x "$file"
+	done
+}
+
+# Lists the patterns in .gitignore, between two marker lines, so that the shared files stay out of git. The rest of
+# .gitignore, and its line endings, are left as they are
+update_ignore() {
+	start='# DLF: shared through the bucket instead of git (written by Tools/DLF/Settings, edit the patterns there)'
+	end='# DLF end'
+	crlf=
+	if [ -f .gitignore ]; then
+		grep -q "$(printf '\r')" .gitignore && crlf=1
+		# Without the old block and without blank lines at the end
+		tr -d '\r' < .gitignore | awk -v s="$start" -v e="$end" '$0 == s { skip = 1; next } skip { if ($0 == e) skip = 0; next } /^$/ { blank++; next } { for (; blank; blank--) print ""; print }' > "$work/ignore"
+	else
+		: > "$work/ignore"
+	fi
+	[ ! -s "$work/ignore" ] || echo >> "$work/ignore"
+	{
+		echo "$start"
+		sed -n 's/^pattern=//p' "$cfg" | tr -d '\r' | sed 's|^|/|'
+		echo "$end"
+	} >> "$work/ignore"
+	if [ -n "$crlf" ]; then
+		awk '{ printf "%s\r\n", $0 }' "$work/ignore" > "$work/ignore.crlf"
+		mv "$work/ignore.crlf" "$work/ignore"
+	fi
+	cmp -s "$work/ignore" .gitignore || cat "$work/ignore" > .gitignore
 }

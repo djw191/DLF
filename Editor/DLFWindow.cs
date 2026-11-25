@@ -7,7 +7,8 @@ using UnityEngine;
 /// <summary>
 /// The DLF window: shows, the way a git client shows changes, which shared files changed on this machine and which
 /// are waiting to be downloaded, whether DLF.txt is committed and whether the bucket has it, and holds every action
-/// (download, upload, reset, unlock). A download never replaces a file changed here: only a reset does. The scripts do the work; this only asks them for the status and runs their commands.
+/// (download, upload, reset, unlock). A download never replaces a file changed here: only a reset does. The scripts do
+/// the work, in the background; this only asks them for the status and starts their commands.
 /// </summary>
 public sealed class DLFWindow : EditorWindow {
 	private const float k_RowHeight = 18;
@@ -22,6 +23,8 @@ public sealed class DLFWindow : EditorWindow {
 	private readonly HashSet<string> m_Picked = new();
 	// How many files are in both lists: changed here and listed differently by DLF.txt
 	private int m_Conflicts;
+	// While the status is being asked for
+	private bool m_Checking;
 	private string m_Message = "";
 	private Vector2 m_Scroll;
 	private static GUIStyle s_Badge, s_Folder;
@@ -35,9 +38,22 @@ public sealed class DLFWindow : EditorWindow {
 		Refresh();
 	}
 
-	// Asks the scripts for the status: "name=value" lines, with one "changed" or "incoming" line per file
+	// Asks the scripts for the status, in the background: "name=value" lines, with one "changed" or "incoming" line per file
 	private void Refresh() {
-		var result = DLF.Run("status");
+		if (m_Checking) {
+			return;
+		}
+		m_Checking = true;
+		DLF.RunInBackground("status", null, result => {
+			if (!this) {
+				return;
+			}
+			m_Checking = false;
+			Show(result);
+		});
+	}
+
+	private void Show((int code, string output, string messages) result) {
 		var lines = result.output.Split('\n').Select(l => l.Trim()).Where(l => l.Contains('=')).Select(l => (name: l.Substring(0, l.IndexOf('=')), value: l.Substring(l.IndexOf('=') + 1))).ToList();
 		m_Changed = lines.Where(l => l.name == "changed").Select(l => l.value).ToList();
 		m_Incoming = lines.Where(l => l.name == "incoming").Select(l => l.value).ToList();
@@ -55,12 +71,18 @@ public sealed class DLFWindow : EditorWindow {
 		return m_Status.TryGetValue(name, out var value) ? value : "";
 	}
 
-	private void Do(string command, IEnumerable<string> arguments = null) {
-		var result = DLF.Run(command, arguments);
-		AssetDatabase.Refresh();
-		m_Message = result.messages.Length > 0 ? result.messages : result.code == 0 ? "Done." : "Stopped.";
-		DLFOverlay.Refresh();
-		Refresh();
+	// Starts an action in the background; Unity's Background Tasks show how far it is and can cancel it
+	private void Do(string command, IEnumerable<string> arguments, string title) {
+		var started = DLF.RunInBackground(command, arguments, result => {
+			AssetDatabase.Refresh();
+			DLFOverlay.Refresh();
+			if (!this) {
+				return;
+			}
+			m_Message = result.messages.Length > 0 ? result.messages : result.code == 0 ? "Done." : "Stopped.";
+			Refresh();
+		}, title);
+		m_Message = started ? $"{title}... Background Tasks, at the bottom right of the Editor, shows how far it is and can cancel it." : "DLF is still busy with something else. Try again when it is done.";
 	}
 
 	private void OnGUI() {
@@ -88,7 +110,10 @@ public sealed class DLFWindow : EditorWindow {
 		}
 
 		m_Scroll = EditorGUILayout.BeginScrollView(m_Scroll, EditorStyles.helpBox);
-		if (m_Changed.Count == 0 && m_Incoming.Count == 0) {
+		if (m_Status.Count == 0 && m_Checking) {
+			GUILayout.Label("Checking...", EditorStyles.wordWrappedLabel);
+		}
+		else if (m_Changed.Count == 0 && m_Incoming.Count == 0) {
 			GUILayout.Label(Status("files").Length == 0 ? "Nothing is shared yet. Set the patterns in Settings; on a machine with a write key, Upload then starts the list." : $"Nothing changed and nothing to download: the {Status("files")} shared files are the ones DLF.txt lists.", EditorStyles.wordWrappedLabel);
 		}
 		if (m_Changed.Count > 0) {
@@ -109,28 +134,28 @@ public sealed class DLFWindow : EditorWindow {
 		// Three rows of buttons, every button of a row the same width
 		var half = GUILayout.Width((position.width - 14) / 2);
 		using (new EditorGUILayout.HorizontalScope()) {
-			using (new EditorGUI.DisabledScope(m_Incoming.Count == 0)) {
+			using (new EditorGUI.DisabledScope(DLF.busy || m_Incoming.Count == 0)) {
 				if (GUILayout.Button(new GUIContent("Download", "Takes what is new in DLF.txt. Files changed on this machine are left alone."), half, GUILayout.Height(26))) {
-					Do("download");
+					Do("download", null, "Downloading the shared large files");
 				}
 			}
-			using (new EditorGUI.DisabledScope(!canUpload || (m_Changed.Count == 0 && Status("uploaded") == "yes"))) {
+			using (new EditorGUI.DisabledScope(DLF.busy || !canUpload || (m_Changed.Count == 0 && Status("uploaded") == "yes"))) {
 				if (GUILayout.Button(new GUIContent("Upload", "Lists the shared files as they are now in DLF.txt and puts them in the bucket. Commit DLF.txt afterwards."), half, GUILayout.Height(26))) {
-					Do("upload");
+					Do("upload", null, "Uploading the shared large files");
 				}
 			}
 		}
 		using (new EditorGUILayout.HorizontalScope()) {
-			using (new EditorGUI.DisabledScope(m_Changed.Count == 0)) {
+			using (new EditorGUI.DisabledScope(DLF.busy || m_Changed.Count == 0)) {
 				if (GUILayout.Button(new GUIContent("Reset All", "Throws the changes made on this machine away: every shared file becomes the one DLF.txt lists."), half) &&
 					EditorUtility.DisplayDialog("DLF", $"Replace the {m_Changed.Count} files changed or deleted on this machine with the ones DLF.txt lists? The changes are lost.", "Reset", "Cancel")) {
-					Do("reset");
+					Do("reset", null, "Resetting the shared large files");
 				}
 			}
-			using (new EditorGUI.DisabledScope(m_Picked.Count == 0)) {
+			using (new EditorGUI.DisabledScope(DLF.busy || m_Picked.Count == 0)) {
 				if (GUILayout.Button(new GUIContent($"Reset Ticked ({m_Picked.Count})", "The same for the ticked files only."), half) &&
 					EditorUtility.DisplayDialog("DLF", $"Replace the {m_Picked.Count} ticked files with the ones DLF.txt lists? The changes made to them here are lost.", "Reset", "Cancel")) {
-					Do("reset", m_Picked.ToList());
+					Do("reset", m_Picked.ToList(), "Resetting the ticked large files");
 				}
 			}
 		}
@@ -145,7 +170,7 @@ public sealed class DLFWindow : EditorWindow {
 				EditorApplication.ExecuteMenuItem("Tools/DLF/Settings");
 			}
 			if (unlock && GUILayout.Button(new GUIContent("Unlock", "Clears a lock that an upload which died left behind."), third)) {
-				Do("unlock");
+				Do("unlock", null, "Unlocking the bucket");
 			}
 		}
 	}

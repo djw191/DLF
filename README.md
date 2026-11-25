@@ -15,6 +15,9 @@ commit lists the files it needs.
 - **Upload**, on a machine with a write key: lists the shared files as they are now in `DLF.txt` and puts them in the
   bucket. You then commit `DLF.txt` with the changes that need the new files.
 
+Downloads and uploads run in the background: Unity's Background Tasks, at the bottom right of the Editor, show how
+far they are and can cancel them.
+
 Nothing happens behind your back in git: the two hooks DLF adds only remind. One speaks up at a commit when shared
 files changed and were not uploaded, the other at a push when it lists files the bucket does not have.
 
@@ -72,7 +75,7 @@ On a machine with a write key, the Editor adds the two reminder hooks without ta
 copies the scripts to `.git/dlf-hooks/` and adds a marked block to the normal `pre-commit` and `pre-push` hooks in
 `.git/hooks/` that calls them first. Hooks that are already there, such as Git LFS's, keep running. A repository that
 keeps its hooks in another folder (`core.hooksPath`) is left alone, with a note in the Console. A machine without a
-write key gets no hooks.
+write key gets no hooks. The block never stops a commit or a push, and the copies follow package updates.
 
 ## The two windows
 
@@ -110,7 +113,10 @@ good. A click on it opens the DLF window.
 - An upload removes files nothing needs, going by the branches the uploading machine last fetched. A branch pushed
   since then, that lists files which are in no list of the bucket, could lose them: upload again from that branch.
 - The hooks remind, they do not enforce: a commit can list files that were never uploaded.
-- Downloading is started by Unity. Without Unity, run `sh Hooks~/dlf download` from the top of the repository.
+- Downloading is started by Unity. Without Unity, run `sh <package folder>/Hooks~/dlf download` from the top of the
+  repository (Unity keeps a package installed from git in `Library/PackageCache`).
+- A single file can be at most 5 GB: a larger one cannot be uploaded in one piece, and DLF does not split files.
+- Only one download, upload or reset runs at a time on a machine.
 - Git must be installed and on the PATH: the git inside GitHub Desktop or another client is not enough. Without it
   the Console says so, and a build stops.
 - A shared file with a line break in its name is not supported.
