@@ -14,9 +14,11 @@ public sealed class DLFWindow : EditorWindow {
 	private const string k_IgnoreEnd = "# DLF end";
 	private const float k_RowHeight = 18;
 	private const float k_ListHeight = 290;
+	// The lines of DLF.cfg this window writes; any other line in it is kept as it is
+	private static readonly string[] k_Names = { "endpoint", "bucket", "region", "readAccessKeyId", "readSecretAccessKey", "pattern" };
 
-	private string m_Patterns, m_Endpoint, m_Bucket, m_ReadKeyId, m_ReadKeySecret, m_WriteKeyId, m_WriteKeySecret;
-	// Every file the patterns match now, once
+	private string m_Patterns, m_Endpoint, m_Bucket, m_Region, m_ReadKeyId, m_ReadKeySecret, m_WriteKeyId, m_WriteKeySecret;
+	// Every file the patterns match now
 	private List<(string path, long size)> m_Files;
 	private Vector2 m_Scroll, m_ListScroll;
 	private bool m_ShowKeys;
@@ -27,16 +29,21 @@ public sealed class DLFWindow : EditorWindow {
 		var window = GetWindow<DLFWindow>("DLF");
 		window.minSize = new Vector2(420, 300);
 		// By default just tall enough to end below the collapsed Keys header; opening Keys scrolls
-		var pattern = Mathf.Clamp(DLF.Patterns().Count + 1, 3, 10) * 15 + 6;
+		var pattern = Mathf.Clamp(window.m_Patterns.Split('\n').Length + 1, 3, 10) * 15 + 6;
 		window.position = new Rect(window.position.x, window.position.y, Mathf.Max(window.position.width, 520), k_ListHeight + pattern + 166);
 	}
 
+	private static string Shared(string name) {
+		return DLF.Values(DLF.At(DLF.k_ConfigName), name).FirstOrDefault() ?? "";
+	}
+
 	private void OnEnable() {
-		m_Endpoint = DLF.Config("endpoint");
-		m_Bucket = DLF.Config("bucket");
-		m_Patterns = string.Join("\n", DLF.Patterns());
-		m_ReadKeyId = DLF.Config("readAccessKeyId");
-		m_ReadKeySecret = DLF.Config("readSecretAccessKey");
+		m_Endpoint = Shared("endpoint");
+		m_Bucket = Shared("bucket");
+		m_Region = Shared("region");
+		m_ReadKeyId = Shared("readAccessKeyId");
+		m_ReadKeySecret = Shared("readSecretAccessKey");
+		m_Patterns = string.Join("\n", DLF.Values(DLF.At(DLF.k_ConfigName), "pattern"));
 		m_WriteKeyId = DLF.Values(DLF.keyPath, "accessKeyId").FirstOrDefault() ?? "";
 		m_WriteKeySecret = DLF.Values(DLF.keyPath, "secretAccessKey").FirstOrDefault() ?? "";
 		m_Files = null;
@@ -44,19 +51,6 @@ public sealed class DLFWindow : EditorWindow {
 
 	private IEnumerable<string> Patterns() {
 		return m_Patterns.Split('\n').Select(p => p.Trim()).Where(p => p.Length > 0).Distinct();
-	}
-
-	private void Match() {
-		var paths = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
-		foreach (var pattern in Patterns()) {
-			try {
-				paths.UnionWith(DLF.Matches(pattern));
-			}
-			catch (Exception) {
-				// A pattern that cannot be read yet (half typed) matches nothing
-			}
-		}
-		m_Files = paths.Select(p => (p, new FileInfo(DLF.At(p)).Length)).ToList();
 	}
 
 	private void OnGUI() {
@@ -68,7 +62,7 @@ public sealed class DLFWindow : EditorWindow {
 		EditorGUI.BeginChangeCheck();
 		m_Patterns = EditorGUILayout.TextArea(m_Patterns, GUILayout.Height(Mathf.Clamp(m_Patterns.Split('\n').Length + 1, 3, 10) * 15 + 6));
 		if (EditorGUI.EndChangeCheck() || m_Files == null) {
-			Match();
+			m_Files = DLF.Matches(Patterns()).Select(p => (p, new FileInfo(DLF.At(p)).Length)).ToList();
 		}
 		EditorGUILayout.LabelField($"{m_Files.Count} files, {EditorUtility.FormatBytes(m_Files.Sum(f => f.size))}", EditorStyles.miniBoldLabel);
 		Files(GUILayoutUtility.GetRect(0, 100000, k_ListHeight, k_ListHeight));
@@ -81,6 +75,7 @@ public sealed class DLFWindow : EditorWindow {
 			EditorGUILayout.LabelField("Bucket", EditorStyles.boldLabel);
 			m_Endpoint = EditorGUILayout.TextField("S3 Endpoint", m_Endpoint).Trim();
 			m_Bucket = EditorGUILayout.TextField("Bucket Name", m_Bucket).Trim();
+			m_Region = EditorGUILayout.TextField(new GUIContent("Region", "Leave empty for Cloudflare R2 (\"auto\"). Other S3 services need theirs."), m_Region).Trim();
 			EditorGUILayout.HelpBox("Where the files are kept. Committed in DLF.cfg.", MessageType.Info);
 			EditorGUILayout.Space();
 			EditorGUILayout.LabelField("Read key", EditorStyles.boldLabel);
@@ -132,23 +127,40 @@ public sealed class DLFWindow : EditorWindow {
 
 	private void Save() {
 		var patterns = Patterns().ToList();
-		var lines = new[] { $"endpoint={m_Endpoint}", $"bucket={m_Bucket}", $"readAccessKeyId={m_ReadKeyId}", $"readSecretAccessKey={m_ReadKeySecret}" }.Concat(patterns.Select(p => $"pattern={p}"));
-		File.WriteAllText(DLF.At(DLF.k_ConfigName), string.Concat(lines.Select(l => l + "\n")));
-		// The block between the two marker lines is replaced; the rest of .gitignore is left as it is
+		var config = DLF.At(DLF.k_ConfigName);
+		var kept = File.Exists(config) ? File.ReadAllLines(config).Where(l => !k_Names.Any(n => l.StartsWith(n + "="))) : Enumerable.Empty<string>();
+		var lines = new List<string> { $"endpoint={m_Endpoint}", $"bucket={m_Bucket}" };
+		if (m_Region.Length > 0) {
+			lines.Add($"region={m_Region}");
+		}
+		lines.Add($"readAccessKeyId={m_ReadKeyId}");
+		lines.Add($"readSecretAccessKey={m_ReadKeySecret}");
+		File.WriteAllText(config, string.Concat(kept.Concat(lines).Concat(patterns.Select(p => $"pattern={p}")).Select(l => l + "\n")));
+
+		// The block between the two marker lines is replaced; the rest of .gitignore, and its line endings, are left as they are
 		var ignorePath = DLF.At(".gitignore");
-		var ignore = File.Exists(ignorePath) ? File.ReadAllText(ignorePath).Replace("\r\n", "\n") : "";
+		var original = File.Exists(ignorePath) ? File.ReadAllText(ignorePath) : "";
+		var ignore = original.Replace("\r\n", "\n");
 		var start = ignore.IndexOf(k_IgnoreStart, StringComparison.Ordinal);
 		var end = ignore.IndexOf(k_IgnoreEnd, StringComparison.Ordinal);
 		if (start >= 0 && end > start) {
 			ignore = ignore.Remove(start, end + k_IgnoreEnd.Length - start);
 		}
-		File.WriteAllText(ignorePath, $"{ignore.TrimEnd('\n')}\n\n{k_IgnoreStart}\n{string.Concat(patterns.Select(p => $"/{p}\n"))}{k_IgnoreEnd}\n");
-		if (m_WriteKeySecret.Length == 0) {
+		ignore = $"{ignore.TrimEnd('\n')}\n\n{k_IgnoreStart}\n{string.Concat(patterns.Select(p => $"/{p}\n"))}{k_IgnoreEnd}\n";
+		File.WriteAllText(ignorePath, original.Contains("\r\n") ? ignore.Replace("\n", "\r\n") : ignore);
+
+		// The key's place depends on the bucket, which may just have changed
+		DLF.keyPath = null;
+		if (DLF.keyPath.Length == 0) {
+			Debug.LogWarning("DLF: the write key was not saved, because git could not be run in this project.");
+		}
+		else if (m_WriteKeySecret.Length == 0) {
 			File.Delete(DLF.keyPath);
 		}
 		else {
 			Directory.CreateDirectory(Path.GetDirectoryName(DLF.keyPath));
 			File.WriteAllText(DLF.keyPath, $"accessKeyId={m_WriteKeyId}\nsecretAccessKey={m_WriteKeySecret}\n");
+			DLF.InstallHooks();
 		}
 	}
 }

@@ -1,0 +1,45 @@
+#!/bin/sh
+# The DLF command, run from the top of the repository (Unity runs it for its menu, on start and before a build):
+#   dlf fetch            makes the shared files the set this commit names in DLF.txt
+#   dlf reset [PATH...]  makes the shared files, or only the selected ones, the ones in the bucket, whatever the commit names
+#   dlf keypath          prints where this machine's write key is kept
+. "$(dirname "$0")/dlf.sh"
+command=$1
+[ $# -gt 0 ] && shift
+case "$command" in
+	keypath)
+		printf '%s\n' "$keys"
+		;;
+	fetch)
+		pointer=$(cat DLF.txt 2> /dev/null | tr -d '\r\n')
+		[ -n "$pointer" ] || exit 0
+		[ "$pointer" = "$(cat "$state/synced" 2> /dev/null)" ] && exit 0
+		use_read_key
+		get_shared_index
+		# The bucket holds one set, which can be newer or older than the one this commit names
+		[ "$(hash_of "$state/shared")" = "$pointer" ] || fail "the shared large files are not the ones this commit names, so none were fetched. Pull the latest changes, or ask whoever changed them to push."
+		# A fetch that fails halfway must not look like this checkout matches anything
+		rm -f "$state/synced"
+		apply
+		note_synced
+		;;
+	reset)
+		use_read_key
+		get_shared_index
+		[ -s "$state/shared" ] || fail "the bucket has no shared files yet."
+		if [ $# -eq 0 ]; then
+			rm -f "$state/synced"
+			apply
+			note_synced
+			# DLF.txt follows: it shows as changed when the bucket's set is not the one this commit names
+			cp "$state/synced" DLF.txt
+		else
+			apply "$@"
+			# The files are no longer what the index was made from
+			rm -f "$state/index"
+		fi
+		;;
+	*)
+		fail "unknown command '$command'. Use fetch, reset or keypath."
+		;;
+esac

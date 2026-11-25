@@ -4,12 +4,11 @@
 # the new files. Pushing uploads them (pre-push).
 . "$(dirname "$0")/dlf.sh"
 [ -f "$keys" ] || exit 0
-mkdir -p "$state"
 current=$(current_set)
 [ -s "$state/index" ] || exit 0
-pointer=$(cat DLF.txt 2>/dev/null | tr -d '\r\n')
+pointer=$(cat DLF.txt 2> /dev/null | tr -d '\r\n')
 [ "$current" = "$pointer" ] && exit 0
-base=$(cat "$state/base" 2>/dev/null)
+base=$(cat "$state/base" 2> /dev/null)
 # A checkout that never fetched the project's set cannot tell a change from an old copy: it names nothing
 [ -n "$pointer" ] && [ -z "$base" ] && exit 0
 # The files are still the ones last seen in the bucket: this branch just names another set

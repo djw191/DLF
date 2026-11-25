@@ -7,34 +7,29 @@
 [ -f "$keys" ] || exit 0
 mkdir -p "$state"
 remote=$1
-base=$(cat "$state/base" 2>/dev/null)
+base=$(cat "$state/base" 2> /dev/null)
 while read -r ref sha remote_ref remote_sha; do
-	pointer=$(git show "$sha:DLF.txt" 2>/dev/null | tr -d '\r\n')
-	# Only a push that brings a change to DLF.txt the remote does not have yet is of interest
+	pointer=$(git show "$sha:DLF.txt" 2> /dev/null | tr -d '\r\n')
 	[ -n "$pointer" ] || continue
-	[ -n "$(git rev-list "$sha" --not --remotes="$remote" -- DLF.txt 2>/dev/null | head -n 1)" ] || continue
-	# Only "no list yet" counts as an empty bucket: any other failure must not lead to uploading everything again
-	code=$(r2 GET index -o "$state/shared" -w '%{http_code}' 2>/dev/null)
-	case "$code" in
-		200) ;;
-		404) : > "$state/shared" ;;
-		*) echo "Push refused: could not read the list of shared large files (answer $code). Try again." >&2; exit 1 ;;
-	esac
+	# Only a push that brings a change to DLF.txt the remote does not have yet is of interest. A push to an address
+	# instead of a named remote is compared with the commit that branch is at there, or with every known remote
+	known="--remotes=$remote"
+	if ! git config "remote.$remote.url" > /dev/null 2>&1; then
+		known=--remotes
+		git cat-file -e "$remote_sha^{commit}" 2> /dev/null && known=$remote_sha
+	fi
+	[ -n "$(git rev-list "$sha" --not "$known" -- DLF.txt 2> /dev/null | head -n 1)" ] || continue
+	use_write_key
+	get_shared_index
 	shared=$(hash_of "$state/shared")
 	if [ "$shared" = "$pointer" ]; then
 		printf '%s' "$pointer" > "$state/base"
 		continue
 	fi
-	if [ "$(current_set)" != "$pointer" ]; then
-		echo "Push refused: $ref names large files that are not uploaded, and this checkout does not have them to upload." >&2
-		echo "Push from the checkout that made that commit." >&2
-		exit 1
-	fi
+	[ "$(current_set)" = "$pointer" ] || fail "push refused: $ref names large files that are not uploaded, and this checkout does not have them to upload. Push from the checkout that made that commit."
 	# The bucket must still hold the set this checkout last saw there, or someone else's newer set would be destroyed
 	if [ -s "$state/shared" ] && [ "$shared" != "$base" ]; then
-		echo "Push refused: someone else published other large files since this checkout last matched the shared ones." >&2
-		echo "Pull their changes, let Unity fetch (Tools > DLF > Fetch), redo your change on top, then push again." >&2
-		exit 1
+		fail "push refused: someone else published other large files since this checkout last matched the shared ones. Pull their changes, let Unity fetch (Tools > DLF > Fetch), redo your change on top, then push again."
 	fi
 	echo "DLF: publishing the large files $ref needs..." >&2
 	cut -d' ' -f1 "$state/shared" | LC_ALL=C sort -u > "$state/old"
