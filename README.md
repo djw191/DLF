@@ -121,6 +121,14 @@ good. A click on it opens the DLF window.
   the Console says so, and a build stops.
 - A shared file with a line break in its name is not supported.
 
+## Tests
+
+`Tests~/dlftest.sh` runs the scripts end to end against a stand-in bucket (`Tests~/fakes3.py`): several checkouts of
+one repository upload, commit, push, pull, download and reset, and it checks the files, `DLF.txt` and the bucket. It
+needs git, curl and python, takes a few minutes, and leaves the Unity side to be tried in the Editor:
+
+    bash Tests~/dlftest.sh
+
 ## Requirements
 
 git, and what it brings or every system has: `sh`, `curl` 7.75 or newer, `gzip`, and `sha256sum` or `shasum`.
