@@ -1,0 +1,6 @@
+{
+    "name": "DLF.Editor",
+    "includePlatforms": [
+        "Editor"
+    ]
+}

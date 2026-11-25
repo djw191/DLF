@@ -1,0 +1,154 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using UnityEditor;
+using UnityEngine;
+
+/// <summary>
+/// Edits DLF.cfg (which files are shared, the bucket and the read key everyone uses, all committed) and this machine's
+/// write key, stored outside the repository. Shows the files the patterns match, and keeps them ignored by git.
+/// </summary>
+public sealed class DLFWindow : EditorWindow {
+	private const string k_IgnoreStart = "# DLF: shared through the bucket instead of git (written by Tools/DLF/Settings, edit the patterns there)";
+	private const string k_IgnoreEnd = "# DLF end";
+	private const float k_RowHeight = 18;
+	private const float k_ListHeight = 290;
+
+	private string m_Patterns, m_Endpoint, m_Bucket, m_ReadKeyId, m_ReadKeySecret, m_WriteKeyId, m_WriteKeySecret;
+	// Every file the patterns match now, once
+	private List<(string path, long size)> m_Files;
+	private Vector2 m_Scroll, m_ListScroll;
+	private bool m_ShowKeys;
+	private static GUIStyle s_Size, s_Folder;
+
+	[MenuItem("Tools/DLF/Settings")]
+	private static void Open() {
+		var window = GetWindow<DLFWindow>("DLF");
+		window.minSize = new Vector2(420, 300);
+		// By default just tall enough to end below the collapsed Keys header; opening Keys scrolls
+		var pattern = Mathf.Clamp(DLF.Patterns().Count + 1, 3, 10) * 15 + 6;
+		window.position = new Rect(window.position.x, window.position.y, Mathf.Max(window.position.width, 520), k_ListHeight + pattern + 166);
+	}
+
+	private void OnEnable() {
+		m_Endpoint = DLF.Config("endpoint");
+		m_Bucket = DLF.Config("bucket");
+		m_Patterns = string.Join("\n", DLF.Patterns());
+		m_ReadKeyId = DLF.Config("readAccessKeyId");
+		m_ReadKeySecret = DLF.Config("readSecretAccessKey");
+		m_WriteKeyId = DLF.Values(DLF.keyPath, "accessKeyId").FirstOrDefault() ?? "";
+		m_WriteKeySecret = DLF.Values(DLF.keyPath, "secretAccessKey").FirstOrDefault() ?? "";
+		m_Files = null;
+	}
+
+	private IEnumerable<string> Patterns() {
+		return m_Patterns.Split('\n').Select(p => p.Trim()).Where(p => p.Length > 0).Distinct();
+	}
+
+	private void Match() {
+		var paths = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+		foreach (var pattern in Patterns()) {
+			try {
+				paths.UnionWith(DLF.Matches(pattern));
+			}
+			catch (Exception) {
+				// A pattern that cannot be read yet (half typed) matches nothing
+			}
+		}
+		m_Files = paths.Select(p => (p, new FileInfo(DLF.At(p)).Length)).ToList();
+	}
+
+	private void OnGUI() {
+		s_Size ??= new GUIStyle(EditorStyles.miniLabel) { alignment = TextAnchor.MiddleRight };
+		s_Folder ??= new GUIStyle(EditorStyles.miniLabel) { normal = { textColor = Color.gray } };
+		m_Scroll = EditorGUILayout.BeginScrollView(m_Scroll);
+
+		EditorGUILayout.LabelField("DLF Patterns", EditorStyles.boldLabel);
+		EditorGUI.BeginChangeCheck();
+		m_Patterns = EditorGUILayout.TextArea(m_Patterns, GUILayout.Height(Mathf.Clamp(m_Patterns.Split('\n').Length + 1, 3, 10) * 15 + 6));
+		if (EditorGUI.EndChangeCheck() || m_Files == null) {
+			Match();
+		}
+		EditorGUILayout.LabelField($"{m_Files.Count} files, {EditorUtility.FormatBytes(m_Files.Sum(f => f.size))}", EditorStyles.miniBoldLabel);
+		Files(GUILayoutUtility.GetRect(0, 100000, k_ListHeight, k_ListHeight));
+		EditorGUILayout.HelpBox("Saving also lists the patterns in .gitignore, so these files stay out of git.", MessageType.Info);
+
+		EditorGUILayout.Space();
+		m_ShowKeys = EditorGUILayout.Foldout(m_ShowKeys, "Keys", true, EditorStyles.foldoutHeader);
+		if (m_ShowKeys) {
+			EditorGUI.indentLevel++;
+			EditorGUILayout.LabelField("Bucket", EditorStyles.boldLabel);
+			m_Endpoint = EditorGUILayout.TextField("S3 Endpoint", m_Endpoint).Trim();
+			m_Bucket = EditorGUILayout.TextField("Bucket Name", m_Bucket).Trim();
+			EditorGUILayout.HelpBox("Where the files are kept. Committed in DLF.cfg.", MessageType.Info);
+			EditorGUILayout.Space();
+			EditorGUILayout.LabelField("Read key", EditorStyles.boldLabel);
+			m_ReadKeyId = EditorGUILayout.TextField("Access Key ID", m_ReadKeyId).Trim();
+			m_ReadKeySecret = EditorGUILayout.TextField("Secret Access Key", m_ReadKeySecret).Trim();
+			EditorGUILayout.HelpBox("Fetches the files. It is committed in DLF.cfg, so everyone with the project can see it: use a read-only token.", MessageType.Info);
+			EditorGUILayout.Space();
+			EditorGUILayout.LabelField("Write key", EditorStyles.boldLabel);
+			m_WriteKeyId = EditorGUILayout.TextField("Access Key ID", m_WriteKeyId).Trim();
+			m_WriteKeySecret = EditorGUILayout.PasswordField("Secret Access Key", m_WriteKeySecret).Trim();
+			EditorGUILayout.HelpBox("Publishes the files on git push. Optional. It stays on this machine and is never stored in the project.", MessageType.Info);
+			EditorGUI.indentLevel--;
+		}
+
+		EditorGUILayout.EndScrollView();
+		if (GUILayout.Button("Save", GUILayout.Height(28))) {
+			Save();
+			Close();
+		}
+	}
+
+	// A file list of fixed height: one row per file, only the rows in view are drawn
+	private void Files(Rect view) {
+		GUI.Box(view, GUIContent.none, EditorStyles.helpBox);
+		view = new Rect(view.x + 1, view.y + 1, view.width - 2, view.height - 2);
+		var content = new Rect(0, 0, view.width - 16, m_Files.Count * k_RowHeight);
+		m_ListScroll = GUI.BeginScrollView(view, m_ListScroll, content);
+		var first = Mathf.Max(0, (int)(m_ListScroll.y / k_RowHeight));
+		var last = Mathf.Min(m_Files.Count - 1, (int)((m_ListScroll.y + view.height) / k_RowHeight));
+		for (var i = first; i <= last; i++) {
+			var (path, size) = m_Files[i];
+			var row = new Rect(0, i * k_RowHeight, content.width, k_RowHeight);
+			if (i % 2 == 1) {
+				EditorGUI.DrawRect(row, new Color(1, 1, 1, 0.03f));
+			}
+			var icon = AssetDatabase.GetCachedIcon(path) ?? EditorGUIUtility.IconContent("TextAsset Icon").image;
+			GUI.DrawTexture(new Rect(row.x + 4, row.y + 1, 16, 16), icon, ScaleMode.ScaleToFit);
+			var name = new GUIContent(Path.GetFileName(path), path);
+			var nameWidth = Mathf.Min(EditorStyles.label.CalcSize(name).x, row.width - 100);
+			// A click shows the file in the Project window
+			if (GUI.Button(new Rect(row.x + 24, row.y, nameWidth, row.height), name, EditorStyles.label)) {
+				EditorGUIUtility.PingObject(AssetDatabase.LoadMainAssetAtPath(path));
+			}
+			GUI.Label(new Rect(row.x + 28 + nameWidth, row.y, row.width - 100 - nameWidth, row.height), Path.GetDirectoryName(path)?.Replace('\\', '/'), s_Folder);
+			GUI.Label(new Rect(row.xMax - 72, row.y, 68, row.height), EditorUtility.FormatBytes(size), s_Size);
+		}
+		GUI.EndScrollView();
+	}
+
+	private void Save() {
+		var patterns = Patterns().ToList();
+		var lines = new[] { $"endpoint={m_Endpoint}", $"bucket={m_Bucket}", $"readAccessKeyId={m_ReadKeyId}", $"readSecretAccessKey={m_ReadKeySecret}" }.Concat(patterns.Select(p => $"pattern={p}"));
+		File.WriteAllText(DLF.At(DLF.k_ConfigName), string.Concat(lines.Select(l => l + "\n")));
+		// The block between the two marker lines is replaced; the rest of .gitignore is left as it is
+		var ignorePath = DLF.At(".gitignore");
+		var ignore = File.Exists(ignorePath) ? File.ReadAllText(ignorePath).Replace("\r\n", "\n") : "";
+		var start = ignore.IndexOf(k_IgnoreStart, StringComparison.Ordinal);
+		var end = ignore.IndexOf(k_IgnoreEnd, StringComparison.Ordinal);
+		if (start >= 0 && end > start) {
+			ignore = ignore.Remove(start, end + k_IgnoreEnd.Length - start);
+		}
+		File.WriteAllText(ignorePath, $"{ignore.TrimEnd('\n')}\n\n{k_IgnoreStart}\n{string.Concat(patterns.Select(p => $"/{p}\n"))}{k_IgnoreEnd}\n");
+		if (m_WriteKeySecret.Length == 0) {
+			File.Delete(DLF.keyPath);
+		}
+		else {
+			Directory.CreateDirectory(Path.GetDirectoryName(DLF.keyPath));
+			File.WriteAllText(DLF.keyPath, $"accessKeyId={m_WriteKeyId}\nsecretAccessKey={m_WriteKeySecret}\n");
+		}
+	}
+}

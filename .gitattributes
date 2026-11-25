@@ -1,0 +1,2 @@
+# Hooks are shell scripts and need Unix line endings on every machine
+/Hooks~/* text eol=lf
