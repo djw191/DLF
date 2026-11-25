@@ -43,6 +43,8 @@ hooks from them. A machine without a write key gets no hooks.
   changed files are uploaded and the ones the new set no longer has are removed from the bucket.
 - **Get someone else's change:** pull and switch to Unity. It fetches what changed.
 - **Not ready to share a change:** commit without staging `DLF.txt`. Nothing is uploaded.
+- **Publish without pushing:** `Tools > DLF > Publish` (or `sh Hooks~/dlf publish`) uploads the set the checked-out
+  commit names, exactly as pushing that commit would. A later push finds the files already there.
 - **Throw a change away:** `Tools > DLF > Reset All To Remote` makes every shared file the one in the bucket.
   `Reset Selected To Remote` does it for the files and folders selected in the Project window.
 

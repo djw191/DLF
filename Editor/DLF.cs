@@ -82,6 +82,12 @@ public sealed class DLF : IPreprocessBuildWithReport {
 		Report(Run("fetch"));
 	}
 
+	// Uploads the set the checked-out commit names, as pushing that commit would, without pushing anything
+	[MenuItem("Tools/DLF/Publish")]
+	private static void Publish() {
+		Report(Run("publish"));
+	}
+
 	[MenuItem("Tools/DLF/Reset All To Remote")]
 	private static void ResetAll() {
 		if (EditorUtility.DisplayDialog("DLF", "Replace all shared files on this machine with the ones in the bucket? Local changes to them are lost.", "Reset", "Cancel")) {

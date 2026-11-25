@@ -2,6 +2,7 @@
 # The DLF command, run from the top of the repository (Unity runs it for its menu, on start and before a build):
 #   dlf fetch            makes the shared files the set this commit names in DLF.txt
 #   dlf reset [PATH...]  makes the shared files, or only the selected ones, the ones in the bucket, whatever the commit names
+#   dlf publish          uploads the set this commit names, as pushing it would, without pushing anything
 #   dlf keypath          prints where this machine's write key is kept
 . "$(dirname "$0")/dlf.sh"
 command=$1
@@ -23,6 +24,13 @@ case "$command" in
 		apply
 		note_synced
 		;;
+	publish)
+		[ -f "$keys" ] || fail "this machine has no write key. Enter one in Tools > DLF > Settings."
+		pointer=$(git show HEAD:DLF.txt 2> /dev/null | tr -d '\r\n')
+		[ -n "$pointer" ] || fail "nothing to publish: the checked-out commit has no DLF.txt. Commit it first."
+		progress=1
+		publish "$pointer" "this commit"
+		;;
 	reset)
 		use_read_key
 		get_shared_index
@@ -40,6 +48,6 @@ case "$command" in
 		fi
 		;;
 	*)
-		fail "unknown command '$command'. Use fetch, reset or keypath."
+		fail "unknown command '$command'. Use fetch, reset, publish or keypath."
 		;;
 esac

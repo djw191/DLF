@@ -2,12 +2,9 @@
 # On a machine that publishes (it has a write key): a change to DLF.txt never leaves without its files. The bucket
 # gets the set first, or the push is refused. Large files that changed here but that no commit names are nobody's
 # business yet: they stay local.
-# The bucket holds one set: new files go up, then the index, then the files only the old set used are removed.
 . "$(dirname "$0")/dlf.sh"
 [ -f "$keys" ] || exit 0
-mkdir -p "$state"
 remote=$1
-base=$(cat "$state/base" 2> /dev/null)
 while read -r ref sha remote_ref remote_sha; do
 	pointer=$(git show "$sha:DLF.txt" 2> /dev/null | tr -d '\r\n')
 	[ -n "$pointer" ] || continue
@@ -19,33 +16,5 @@ while read -r ref sha remote_ref remote_sha; do
 		git cat-file -e "$remote_sha^{commit}" 2> /dev/null && known=$remote_sha
 	fi
 	[ -n "$(git rev-list "$sha" --not "$known" -- DLF.txt 2> /dev/null | head -n 1)" ] || continue
-	use_write_key
-	get_shared_index
-	shared=$(hash_of "$state/shared")
-	if [ "$shared" = "$pointer" ]; then
-		printf '%s' "$pointer" > "$state/base"
-		continue
-	fi
-	[ "$(current_set)" = "$pointer" ] || fail "push refused: $ref names large files that are not uploaded, and this checkout does not have them to upload. Push from the checkout that made that commit."
-	# The bucket must still hold the set this checkout last saw there, or someone else's newer set would be destroyed
-	if [ -s "$state/shared" ] && [ "$shared" != "$base" ]; then
-		fail "push refused: someone else published other large files since this checkout last matched the shared ones. Pull their changes, let Unity fetch (Tools > DLF > Fetch), redo your change on top, then push again."
-	fi
-	echo "DLF: publishing the large files $ref needs..." >&2
-	cut -d' ' -f1 "$state/shared" | LC_ALL=C sort -u > "$state/old"
-	cut -d' ' -f1 "$state/index" | LC_ALL=C sort -u > "$state/new"
-	while read -r hash path; do
-		grep -qxF "$hash" "$state/old" && continue
-		echo "  $path" >&2
-		gzip -1 -c "$path" > "$state/tmp"
-		r2 PUT "files/$hash" -H "x-amz-content-sha256: $(hash_of "$state/tmp")" -T "$state/tmp" > /dev/null || exit 1
-	done < "$state/index"
-	r2 PUT index -H "x-amz-content-sha256: $pointer" -T "$state/index" > /dev/null || exit 1
-	comm -23 "$state/old" "$state/new" | while read -r hash; do
-		r2 DELETE "files/$hash" > /dev/null
-	done
-	rm -f "$state/tmp"
-	base=$pointer
-	printf '%s' "$pointer" > "$state/base"
-	echo "DLF: published." >&2
+	publish "$pointer" "$ref"
 done

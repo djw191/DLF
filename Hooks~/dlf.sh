@@ -179,3 +179,42 @@ note_synced() {
 	hash_of "$state/shared" | tr -d '\n' > "$state/synced"
 	cp "$state/synced" "$state/base"
 }
+
+# publish POINTER WHAT: puts the set POINTER names into the bucket, from this checkout's files, unless it is there already.
+# WHAT (a branch, "this commit") names the set in messages. The bucket holds one set: new files go up, then the index,
+# then the files only the old set used are removed. Stops when this checkout cannot or must not do it
+publish() {
+	pointer=$1
+	use_write_key
+	get_shared_index
+	shared=$(hash_of "$state/shared")
+	if [ "$shared" = "$pointer" ]; then
+		printf '%s' "$pointer" > "$state/base"
+		return 0
+	fi
+	[ "$(current_set)" = "$pointer" ] || fail "not published: $2 names large files that are not uploaded, and this checkout does not have them to upload. Publish from the checkout that made that commit."
+	# The bucket must still hold the set this checkout last saw there, or someone else's newer set would be destroyed
+	if [ -s "$state/shared" ] && [ "$shared" != "$(cat "$state/base" 2> /dev/null)" ]; then
+		fail "not published: someone else published other large files since this checkout last matched the shared ones. Pull their changes, let Unity fetch (Tools > DLF > Fetch), redo your change on top, then try again."
+	fi
+	echo "DLF: publishing the large files $2 needs..." >&2
+	cut -d' ' -f1 "$state/shared" | LC_ALL=C sort -u > "$state/old"
+	cut -d' ' -f1 "$state/index" | LC_ALL=C sort -u > "$state/new"
+	total=$(wc -l < "$state/index" | tr -d ' ')
+	done=0
+	while read -r hash path; do
+		done=$((done + 1))
+		grep -qxF "$hash" "$state/old" && continue
+		# The dlf command reports progress for Unity's bar; a hook lists the files in the terminal
+		if [ -n "$progress" ]; then echo "PROGRESS $done $total $path"; else echo "  $path" >&2; fi
+		gzip -1 -c "$path" > "$state/tmp"
+		r2 PUT "files/$hash" -H "x-amz-content-sha256: $(hash_of "$state/tmp")" -T "$state/tmp" > /dev/null || fail "not published: could not upload $path."
+	done < "$state/index"
+	r2 PUT index -H "x-amz-content-sha256: $pointer" -T "$state/index" > /dev/null || fail "not published: could not upload the list."
+	comm -23 "$state/old" "$state/new" | while read -r hash; do
+		r2 DELETE "files/$hash" > /dev/null
+	done
+	rm -f "$state/tmp"
+	printf '%s' "$pointer" > "$state/base"
+	echo "DLF: published." >&2
+}
