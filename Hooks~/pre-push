@@ -1,13 +1,11 @@
 #!/bin/sh
-# On a machine that publishes (it has a write key): a change to DLF.txt never leaves without its files. The bucket
-# gets the set first, or the push is refused. Large files that changed here but that no commit names are nobody's
-# business yet: they stay local.
+# A reminder only, on a machine with a write key: it changes nothing and never stops a push. It speaks up when the push
+# brings a change to DLF.txt and the bucket does not have that list for the branch, so others could not download the files.
 . "$(dirname "$0")/dlf.sh"
 [ -f "$keys" ] || exit 0
 remote=$1
 while read -r ref sha remote_ref remote_sha; do
-	pointer=$(git show "$sha:DLF.txt" 2> /dev/null | tr -d '\r\n')
-	[ -n "$pointer" ] || continue
+	id=$(git rev-parse -q --verify "$sha:DLF.txt" 2> /dev/null) || continue
 	# Only a push that brings a change to DLF.txt the remote does not have yet is of interest. A push to an address
 	# instead of a named remote is compared with the commit that branch is at there, or with every known remote
 	known="--remotes=$remote"
@@ -16,5 +14,16 @@ while read -r ref sha remote_ref remote_sha; do
 		git cat-file -e "$remote_sha^{commit}" 2> /dev/null && known=$remote_sha
 	fi
 	[ -n "$(git rev-list "$sha" --not "$known" -- DLF.txt 2> /dev/null | head -n 1)" ] || continue
-	publish "$pointer" "$ref"
+	# Asking the bucket must never stop the push: when it cannot be reached, nothing is said
+	(
+		use_read_key
+		get "$(branch_key "${remote_ref#refs/heads/}")" "$state/old"
+		there=$(list_id < "$state/old")
+		rm -f "$state/old"
+		[ "$there" = "$id" ] || exit 2
+	) 2> /dev/null < /dev/null
+	if [ $? -eq 2 ]; then
+		echo "DLF: ${remote_ref#refs/heads/} now lists large files that are not uploaded for it. Others cannot download them until you use Upload in the DLF window (Tools > DLF > DLF)." >&2
+	fi
 done
+exit 0

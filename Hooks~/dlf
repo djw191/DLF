@@ -1,8 +1,11 @@
 #!/bin/sh
-# The DLF command, run from the top of the repository (Unity runs it for its menu, on start and before a build):
-#   dlf fetch            makes the shared files the set this commit names in DLF.txt
-#   dlf reset [PATH...]  makes the shared files, or only the selected ones, the ones in the bucket, whatever the commit names
-#   dlf publish          uploads the set this commit names, as pushing it would, without pushing anything
+# The DLF command, run from the top of the repository (Unity runs it for the DLF window, on start and before a build):
+#   dlf download [auto]  makes the shared files the ones DLF.txt lists; with auto, not over files changed here
+#   dlf upload           lists the shared files as they are now in DLF.txt and puts them in the bucket
+#   dlf reset [PATH...]  throws local changes away: the shared files, or only the selected ones, become the ones the
+#                        checked-out commit lists, and DLF.txt goes back to that commit's
+#   dlf unlock           clears a lock an upload left behind
+#   dlf status           prints what the DLF window shows: this machine's files, DLF.txt, and the bucket
 #   dlf keypath          prints where this machine's write key is kept
 . "$(dirname "$0")/dlf.sh"
 command=$1
@@ -11,43 +14,86 @@ case "$command" in
 	keypath)
 		printf '%s\n' "$keys"
 		;;
-	fetch)
-		pointer=$(cat DLF.txt 2> /dev/null | tr -d '\r\n')
-		[ -n "$pointer" ] || exit 0
-		[ "$pointer" = "$(cat "$state/synced" 2> /dev/null)" ] && exit 0
+	download)
+		[ -f DLF.txt ] || exit 0
+		# Nothing to do while DLF.txt is the list this checkout already took. Files changed here since then (a rebake that
+		# is not uploaded yet) are left alone: only a new DLF.txt, or reset, replaces them
+		[ "$(cat "$state/synced" 2> /dev/null)" = "$(list_id < DLF.txt)" ] && exit 0
+		# "download auto" is what Unity runs by itself: it never replaces files that were changed here and not uploaded.
+		# That is a conflict for a person to settle, with Download or Reset in the DLF window, or by uploading
+		if [ "$1" = auto ] && [ -f "$state/synced" ] && ! unchanged; then
+			fail "DLF.txt lists new files, but large files were changed on this machine and not uploaded, so nothing was downloaded. Open the DLF window: Download replaces your changes, Upload shares them."
+		fi
 		use_read_key
-		get_shared_index
-		# The bucket holds one set, which can be newer or older than the one this commit names
-		[ "$(hash_of "$state/shared")" = "$pointer" ] || fail "the shared large files are not the ones this commit names, so none were fetched. Pull the latest changes, or ask whoever changed them to push."
-		# A fetch that fails halfway must not look like this checkout matches anything
-		rm -f "$state/synced"
-		apply
-		note_synced
+		tr -d '\r' < DLF.txt > "$state/list"
+		apply "$state/list"
+		rm -f "$state/list"
 		;;
-	publish)
-		[ -f "$keys" ] || fail "this machine has no write key. Enter one in Tools > DLF > Settings."
-		pointer=$(git show HEAD:DLF.txt 2> /dev/null | tr -d '\r\n')
-		[ -n "$pointer" ] || fail "nothing to publish: the checked-out commit has no DLF.txt. Commit it first."
-		progress=1
-		publish "$pointer" "this commit"
+	upload)
+		branch=$(current_branch) || fail "nothing to upload: no branch is checked out."
+		upload "$branch"
 		;;
 	reset)
 		use_read_key
-		get_shared_index
-		[ -s "$state/shared" ] || fail "the bucket has no shared files yet."
+		git show HEAD:DLF.txt > "$state/list" 2> /dev/null || fail "the checked-out commit has no DLF.txt, so there is nothing to reset to."
+		apply "$state/list" "$@"
+		rm -f "$state/list"
 		if [ $# -eq 0 ]; then
-			rm -f "$state/synced"
-			apply
-			note_synced
-			# DLF.txt follows: it shows as changed when the bucket's set is not the one this commit names
-			cp "$state/synced" DLF.txt
-		else
-			apply "$@"
-			# The files are no longer what the index was made from
-			rm -f "$state/index"
+			git checkout -q HEAD -- DLF.txt
 		fi
 		;;
+	unlock)
+		use_write_key
+		r2 DELETE lock > /dev/null || fail "could not clear the lock."
+		echo "DLF: unlocked." >&2
+		;;
+	status)
+		# For the DLF window: one name=value line per fact. The bucket is asked last; when it cannot be reached, the
+		# facts about this machine are still there
+		echo "project=$project"
+		echo "branch=$(current_branch)"
+		if [ -f "$keys" ]; then echo "key=write"; elif [ -n "$(value readSecretAccessKey "$cfg")" ]; then echo "key=read"; else echo "key=none"; fi
+		if [ -f DLF.txt ]; then
+			echo "files=$(wc -l < DLF.txt | tr -d ' ')"
+			if [ -z "$(git status --porcelain -- DLF.txt)" ]; then echo "committed=yes"; else echo "committed=no"; fi
+		fi
+		# Per file, as git status does. "changed": this machine's files against the list it last took (added, deleted,
+		# or written since). "incoming": that list against DLF.txt, which is what a download would bring
+		if [ -f "$state/synced" ] && git cat-file -e "$(cat "$state/synced")" 2> /dev/null; then
+			git cat-file blob "$(cat "$state/synced")" | sort > "$state/have"
+		else
+			: > "$state/have"
+		fi
+		cut -d' ' -f2- "$state/have" | sort > "$state/have.paths"
+		shared_files | tr '\000' '\n' | sort > "$state/here"
+		comm -13 "$state/have.paths" "$state/here" | sed 's/^/changed=A /'
+		comm -23 "$state/have.paths" "$state/here" | sed 's/^/changed=D /'
+		comm -12 "$state/have.paths" "$state/here" | while IFS= read -r file; do
+			if [ "$file" -nt "$state/synced" ]; then echo "changed=M $file"; fi
+		done
+		if [ -f DLF.txt ]; then
+			tr -d '\r' < DLF.txt | sort > "$state/want"
+			comm -13 "$state/have" "$state/want" | cut -d' ' -f2- | while IFS= read -r file; do
+				if grep -qxF "$file" "$state/have.paths"; then echo "incoming=M $file"; else echo "incoming=A $file"; fi
+			done
+			cut -d' ' -f2- "$state/want" | sort | comm -23 "$state/have.paths" - | sed 's/^/incoming=D /'
+		fi
+		rm -f "$state/have" "$state/have.paths" "$state/here" "$state/want"
+		# "status local" stops here: quick, and without asking the bucket
+		[ "$1" = local ] && exit 0
+		(
+			use_read_key 2> /dev/null
+			get lock "$state/lock"
+			IFS='|' read -r owner since what < "$state/lock" || true
+			rm -f "$state/lock"
+			if [ -n "$since" ] && [ $(($(date +%s) - since)) -lt $lock_seconds ]; then echo "lock=$owner is uploading $what"; fi
+			[ -f DLF.txt ] || exit 0
+			get "$(branch_key "$(current_branch)")" "$state/old"
+			if [ "$(list_id < "$state/old")" = "$(list_id < DLF.txt)" ]; then echo "uploaded=yes"; else echo "uploaded=no"; fi
+			rm -f "$state/old"
+		) 2> /dev/null || echo "bucket=unreachable"
+		;;
 	*)
-		fail "unknown command '$command'. Use fetch, reset, publish or keypath."
+		fail "unknown command '$command'. Use download, upload, reset, unlock, status or keypath."
 		;;
 esac

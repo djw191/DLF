@@ -1,4 +1,3 @@
-using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -6,161 +5,176 @@ using UnityEditor;
 using UnityEngine;
 
 /// <summary>
-/// Edits DLF.cfg (which files are shared, the bucket and the read key everyone uses, all committed) and this machine's
-/// write key, stored outside the repository. Shows the files the patterns match, and keeps them ignored by git.
+/// The DLF window: shows, the way a git client shows changes, which shared files changed on this machine and which
+/// are waiting to be downloaded, whether DLF.txt is committed and whether the bucket has it, and holds every action
+/// (download, upload, reset, unlock). The scripts do the work; this only asks them for the status and runs their commands.
 /// </summary>
 public sealed class DLFWindow : EditorWindow {
-	private const string k_IgnoreStart = "# DLF: shared through the bucket instead of git (written by Tools/DLF/Settings, edit the patterns there)";
-	private const string k_IgnoreEnd = "# DLF end";
 	private const float k_RowHeight = 18;
-	private const float k_ListHeight = 290;
-	// The lines of DLF.cfg this window writes; any other line in it is kept as it is
-	private static readonly string[] k_Names = { "endpoint", "bucket", "region", "readAccessKeyId", "readSecretAccessKey", "pattern" };
+	// The colours a git client uses for added, modified and deleted
+	private static readonly Dictionary<char, Color> k_Colors = new() {
+		['A'] = new Color(0.25f, 0.73f, 0.31f), ['M'] = new Color(0.82f, 0.60f, 0.13f), ['D'] = new Color(0.97f, 0.32f, 0.29f)
+	};
 
-	private string m_Patterns, m_Endpoint, m_Bucket, m_Region, m_ReadKeyId, m_ReadKeySecret, m_WriteKeyId, m_WriteKeySecret;
-	// Every file the patterns match now
-	private List<(string path, long size)> m_Files;
-	private Vector2 m_Scroll, m_ListScroll;
-	private bool m_ShowKeys;
-	private static GUIStyle s_Size, s_Folder;
+	private Dictionary<string, string> m_Status = new();
+	// "A path", "M path" or "D path": changed on this machine, and what a download would bring
+	private List<string> m_Changed = new(), m_Incoming = new();
+	private readonly HashSet<string> m_Picked = new();
+	private string m_Message = "";
+	private Vector2 m_Scroll;
+	private static GUIStyle s_Badge, s_Folder;
 
-	[MenuItem("Tools/DLF/Settings")]
+	[MenuItem("Tools/DLF/DLF")]
 	private static void Open() {
-		var window = GetWindow<DLFWindow>("DLF");
-		window.minSize = new Vector2(420, 300);
-		// By default just tall enough to end below the collapsed Keys header; opening Keys scrolls
-		var pattern = Mathf.Clamp(window.m_Patterns.Split('\n').Length + 1, 3, 10) * 15 + 6;
-		window.position = new Rect(window.position.x, window.position.y, Mathf.Max(window.position.width, 520), k_ListHeight + pattern + 166);
-	}
-
-	private static string Shared(string name) {
-		return DLF.Values(DLF.At(DLF.k_ConfigName), name).FirstOrDefault() ?? "";
+		GetWindow<DLFWindow>("DLF").minSize = new Vector2(400, 420);
 	}
 
 	private void OnEnable() {
-		m_Endpoint = Shared("endpoint");
-		m_Bucket = Shared("bucket");
-		m_Region = Shared("region");
-		m_ReadKeyId = Shared("readAccessKeyId");
-		m_ReadKeySecret = Shared("readSecretAccessKey");
-		m_Patterns = string.Join("\n", DLF.Values(DLF.At(DLF.k_ConfigName), "pattern"));
-		m_WriteKeyId = DLF.Values(DLF.keyPath, "accessKeyId").FirstOrDefault() ?? "";
-		m_WriteKeySecret = DLF.Values(DLF.keyPath, "secretAccessKey").FirstOrDefault() ?? "";
-		m_Files = null;
+		Refresh();
 	}
 
-	private IEnumerable<string> Patterns() {
-		return m_Patterns.Split('\n').Select(p => p.Trim()).Where(p => p.Length > 0).Distinct();
+	// Asks the scripts for the status: "name=value" lines, with one "changed" or "incoming" line per file
+	private void Refresh() {
+		var result = DLF.Run("status");
+		var lines = result.output.Split('\n').Select(l => l.Trim()).Where(l => l.Contains('=')).Select(l => (name: l.Substring(0, l.IndexOf('=')), value: l.Substring(l.IndexOf('=') + 1))).ToList();
+		m_Changed = lines.Where(l => l.name == "changed").Select(l => l.value).ToList();
+		m_Incoming = lines.Where(l => l.name == "incoming").Select(l => l.value).ToList();
+		m_Status = lines.Where(l => l.name != "changed" && l.name != "incoming").GroupBy(l => l.name).ToDictionary(g => g.Key, g => g.Last().value);
+		m_Picked.IntersectWith(m_Changed.Select(c => c.Substring(2)));
+		if (result.code != 0) {
+			m_Message = result.messages;
+		}
+		Repaint();
+	}
+
+	private string Status(string name) {
+		return m_Status.TryGetValue(name, out var value) ? value : "";
+	}
+
+	private void Do(string command, IEnumerable<string> arguments = null) {
+		var result = DLF.Run(command, arguments);
+		AssetDatabase.Refresh();
+		m_Message = result.messages.Length > 0 ? result.messages : result.code == 0 ? "Done." : "Stopped.";
+		DLFOverlay.Refresh();
+		Refresh();
 	}
 
 	private void OnGUI() {
-		s_Size ??= new GUIStyle(EditorStyles.miniLabel) { alignment = TextAnchor.MiddleRight };
+		s_Badge ??= new GUIStyle(EditorStyles.miniBoldLabel) { alignment = TextAnchor.MiddleCenter, normal = { textColor = Color.white } };
 		s_Folder ??= new GUIStyle(EditorStyles.miniLabel) { normal = { textColor = Color.gray } };
-		m_Scroll = EditorGUILayout.BeginScrollView(m_Scroll);
+		var branch = Status("branch").Length > 0 ? Status("branch") : "no branch";
+		var canUpload = Status("key") == "write";
 
-		EditorGUILayout.LabelField("DLF Patterns", EditorStyles.boldLabel);
-		EditorGUI.BeginChangeCheck();
-		m_Patterns = EditorGUILayout.TextArea(m_Patterns, GUILayout.Height(Mathf.Clamp(m_Patterns.Split('\n').Length + 1, 3, 10) * 15 + 6));
-		if (EditorGUI.EndChangeCheck() || m_Files == null) {
-			m_Files = DLF.Matches(Patterns()).Select(p => (p, new FileInfo(DLF.At(p)).Length)).ToList();
+		EditorGUILayout.LabelField($"{Status("project")} - {branch}", EditorStyles.boldLabel);
+		EditorGUILayout.LabelField(canUpload ? "This machine can upload." : Status("key") == "read" ? "This machine downloads only: it has no write key." : "No key is set up yet. Open Settings.", EditorStyles.miniLabel);
+		if (Status("committed") == "no") {
+			Row("console.warnicon.sml", "DLF.txt changed and is not committed. Others get the new files once it is committed and they have that commit.");
 		}
-		EditorGUILayout.LabelField($"{m_Files.Count} files, {EditorUtility.FormatBytes(m_Files.Sum(f => f.size))}", EditorStyles.miniBoldLabel);
-		Files(GUILayoutUtility.GetRect(0, 100000, k_ListHeight, k_ListHeight));
-		EditorGUILayout.HelpBox("Saving also lists the patterns in .gitignore, so these files stay out of git.", MessageType.Info);
-
-		EditorGUILayout.Space();
-		m_ShowKeys = EditorGUILayout.Foldout(m_ShowKeys, "Keys", true, EditorStyles.foldoutHeader);
-		if (m_ShowKeys) {
-			EditorGUI.indentLevel++;
-			EditorGUILayout.LabelField("Bucket", EditorStyles.boldLabel);
-			m_Endpoint = EditorGUILayout.TextField("S3 Endpoint", m_Endpoint).Trim();
-			m_Bucket = EditorGUILayout.TextField("Bucket Name", m_Bucket).Trim();
-			m_Region = EditorGUILayout.TextField(new GUIContent("Region", "Leave empty for Cloudflare R2 (\"auto\"). Other S3 services need theirs."), m_Region).Trim();
-			EditorGUILayout.HelpBox("Where the files are kept. Committed in DLF.cfg.", MessageType.Info);
-			EditorGUILayout.Space();
-			EditorGUILayout.LabelField("Read key", EditorStyles.boldLabel);
-			m_ReadKeyId = EditorGUILayout.TextField("Access Key ID", m_ReadKeyId).Trim();
-			m_ReadKeySecret = EditorGUILayout.TextField("Secret Access Key", m_ReadKeySecret).Trim();
-			EditorGUILayout.HelpBox("Fetches the files. It is committed in DLF.cfg, so everyone with the project can see it: use a read-only token.", MessageType.Info);
-			EditorGUILayout.Space();
-			EditorGUILayout.LabelField("Write key", EditorStyles.boldLabel);
-			m_WriteKeyId = EditorGUILayout.TextField("Access Key ID", m_WriteKeyId).Trim();
-			m_WriteKeySecret = EditorGUILayout.PasswordField("Secret Access Key", m_WriteKeySecret).Trim();
-			EditorGUILayout.HelpBox("Publishes the files on git push. Optional. It stays on this machine and is never stored in the project.", MessageType.Info);
-			EditorGUI.indentLevel--;
+		if (Status("bucket") == "unreachable") {
+			Row("console.erroricon.sml", "The bucket could not be reached.");
+		}
+		else if (Status("lock").Length > 0) {
+			Row("console.warnicon.sml", $"{Status("lock")} right now.");
+		}
+		else if (Status("uploaded") == "yes") {
+			Row("TestPassed", $"The bucket has the files DLF.txt lists, as the set of {branch}.");
+		}
+		else if (Status("uploaded") == "no") {
+			Row("console.warnicon.sml", canUpload ? $"The bucket does not have this list for {branch}. Upload it." : $"The bucket does not have this list for {branch}. Whoever changed the files has to upload them.");
 		}
 
+		m_Scroll = EditorGUILayout.BeginScrollView(m_Scroll, EditorStyles.helpBox);
+		if (m_Changed.Count == 0 && m_Incoming.Count == 0) {
+			GUILayout.Label(Status("files").Length == 0 ? "Nothing is shared yet. Set the patterns in Settings; on a machine with a write key, Upload then starts the list." : $"Nothing changed and nothing to download: the {Status("files")} shared files are the ones DLF.txt lists.", EditorStyles.wordWrappedLabel);
+		}
+		if (m_Changed.Count > 0) {
+			GUILayout.Label($"Changed on this machine ({m_Changed.Count})", EditorStyles.boldLabel);
+			GUILayout.Label(canUpload ? "Upload to share them. Tick files to reset only those." : "Not shared with anyone. Tick files to reset only those.", EditorStyles.miniLabel);
+			foreach (var change in m_Changed) {
+				FileRow(change, true);
+			}
+		}
+		if (m_Incoming.Count > 0) {
+			GUILayout.Label($"To download ({m_Incoming.Count})", EditorStyles.boldLabel);
+			GUILayout.Label("DLF.txt lists these differently from what this machine last took.", EditorStyles.miniLabel);
+			foreach (var change in m_Incoming) {
+				FileRow(change, false);
+			}
+		}
 		EditorGUILayout.EndScrollView();
-		if (GUILayout.Button("Save", GUILayout.Height(28))) {
-			Save();
-			Close();
+
+		if (m_Message.Length > 0) {
+			EditorGUILayout.HelpBox(m_Message, MessageType.None);
+		}
+		// Three rows of buttons, every button of a row the same width
+		var half = GUILayout.Width((position.width - 14) / 2);
+		using (new EditorGUILayout.HorizontalScope()) {
+			using (new EditorGUI.DisabledScope(m_Incoming.Count == 0)) {
+				// With changes here that were not uploaded, downloading replaces them: that needs a yes
+				if (GUILayout.Button(new GUIContent("Download", "Makes the shared files the ones DLF.txt lists."), half, GUILayout.Height(26)) &&
+					(m_Changed.Count == 0 || EditorUtility.DisplayDialog("DLF", $"{m_Changed.Count} shared files were changed on this machine and not uploaded. Downloading replaces them with the ones DLF.txt lists.", "Download", "Cancel"))) {
+					Do("download");
+				}
+			}
+			using (new EditorGUI.DisabledScope(!canUpload || (m_Changed.Count == 0 && Status("uploaded") == "yes"))) {
+				if (GUILayout.Button(new GUIContent("Upload", "Lists the shared files as they are now in DLF.txt and puts them in the bucket. Commit DLF.txt afterwards."), half, GUILayout.Height(26))) {
+					Do("upload");
+				}
+			}
+		}
+		using (new EditorGUILayout.HorizontalScope()) {
+			using (new EditorGUI.DisabledScope(m_Changed.Count == 0)) {
+				if (GUILayout.Button(new GUIContent("Reset All", "Throws local changes away: every shared file becomes the one the checked-out commit lists."), half) &&
+					EditorUtility.DisplayDialog("DLF", "Replace all shared files on this machine with the ones the checked-out commit lists? Local changes to them are lost.", "Reset", "Cancel")) {
+					Do("reset");
+				}
+			}
+			using (new EditorGUI.DisabledScope(m_Picked.Count == 0)) {
+				if (GUILayout.Button(new GUIContent($"Reset Ticked ({m_Picked.Count})", "The same for the ticked files only."), half) &&
+					EditorUtility.DisplayDialog("DLF", $"Replace the {m_Picked.Count} ticked files with the ones the checked-out commit lists? Local changes to them are lost.", "Reset", "Cancel")) {
+					Do("reset", m_Picked.ToList());
+				}
+			}
+		}
+		var unlock = canUpload && Status("lock").Length > 0;
+		var third = unlock ? GUILayout.Width((position.width - 18) / 3) : half;
+		using (new EditorGUILayout.HorizontalScope()) {
+			if (GUILayout.Button("Refresh", third)) {
+				m_Message = "";
+				Refresh();
+			}
+			if (GUILayout.Button("Settings", third)) {
+				EditorApplication.ExecuteMenuItem("Tools/DLF/Settings");
+			}
+			if (unlock && GUILayout.Button(new GUIContent("Unlock", "Clears a lock that an upload which died left behind."), third)) {
+				Do("unlock");
+			}
 		}
 	}
 
-	// A file list of fixed height: one row per file, only the rows in view are drawn
-	private void Files(Rect view) {
-		GUI.Box(view, GUIContent.none, EditorStyles.helpBox);
-		view = new Rect(view.x + 1, view.y + 1, view.width - 2, view.height - 2);
-		var content = new Rect(0, 0, view.width - 16, m_Files.Count * k_RowHeight);
-		m_ListScroll = GUI.BeginScrollView(view, m_ListScroll, content);
-		var first = Mathf.Max(0, (int)(m_ListScroll.y / k_RowHeight));
-		var last = Mathf.Min(m_Files.Count - 1, (int)((m_ListScroll.y + view.height) / k_RowHeight));
-		for (var i = first; i <= last; i++) {
-			var (path, size) = m_Files[i];
-			var row = new Rect(0, i * k_RowHeight, content.width, k_RowHeight);
-			if (i % 2 == 1) {
-				EditorGUI.DrawRect(row, new Color(1, 1, 1, 0.03f));
-			}
-			var icon = AssetDatabase.GetCachedIcon(path) ?? EditorGUIUtility.IconContent("TextAsset Icon").image;
-			GUI.DrawTexture(new Rect(row.x + 4, row.y + 1, 16, 16), icon, ScaleMode.ScaleToFit);
-			var name = new GUIContent(Path.GetFileName(path), path);
-			var nameWidth = Mathf.Min(EditorStyles.label.CalcSize(name).x, row.width - 100);
-			// A click shows the file in the Project window
-			if (GUI.Button(new Rect(row.x + 24, row.y, nameWidth, row.height), name, EditorStyles.label)) {
-				EditorGUIUtility.PingObject(AssetDatabase.LoadMainAssetAtPath(path));
-			}
-			GUI.Label(new Rect(row.x + 28 + nameWidth, row.y, row.width - 100 - nameWidth, row.height), Path.GetDirectoryName(path)?.Replace('\\', '/'), s_Folder);
-			GUI.Label(new Rect(row.xMax - 72, row.y, 68, row.height), EditorUtility.FormatBytes(size), s_Size);
+	private static void Row(string icon, string text) {
+		using (new EditorGUILayout.HorizontalScope()) {
+			GUILayout.Label(EditorGUIUtility.IconContent(icon), GUILayout.Width(20), GUILayout.Height(18));
+			GUILayout.Label(text, EditorStyles.wordWrappedLabel);
 		}
-		GUI.EndScrollView();
 	}
 
-	private void Save() {
-		var patterns = Patterns().ToList();
-		var config = DLF.At(DLF.k_ConfigName);
-		var kept = File.Exists(config) ? File.ReadAllLines(config).Where(l => !k_Names.Any(n => l.StartsWith(n + "="))) : Enumerable.Empty<string>();
-		var lines = new List<string> { $"endpoint={m_Endpoint}", $"bucket={m_Bucket}" };
-		if (m_Region.Length > 0) {
-			lines.Add($"region={m_Region}");
+	// One file: a tick box where it can be reset, a coloured letter (Added, Modified, Deleted), its name and its folder
+	private void FileRow(string change, bool pickable) {
+		var path = change.Substring(2);
+		var row = EditorGUILayout.GetControlRect(false, k_RowHeight);
+		if (pickable) {
+			var picked = GUI.Toggle(new Rect(row.x, row.y, 16, row.height), m_Picked.Contains(path), GUIContent.none);
+			if (picked != m_Picked.Contains(path) && !m_Picked.Remove(path)) {
+				m_Picked.Add(path);
+			}
 		}
-		lines.Add($"readAccessKeyId={m_ReadKeyId}");
-		lines.Add($"readSecretAccessKey={m_ReadKeySecret}");
-		File.WriteAllText(config, string.Concat(kept.Concat(lines).Concat(patterns.Select(p => $"pattern={p}")).Select(l => l + "\n")));
-
-		// The block between the two marker lines is replaced; the rest of .gitignore, and its line endings, are left as they are
-		var ignorePath = DLF.At(".gitignore");
-		var original = File.Exists(ignorePath) ? File.ReadAllText(ignorePath) : "";
-		var ignore = original.Replace("\r\n", "\n");
-		var start = ignore.IndexOf(k_IgnoreStart, StringComparison.Ordinal);
-		var end = ignore.IndexOf(k_IgnoreEnd, StringComparison.Ordinal);
-		if (start >= 0 && end > start) {
-			ignore = ignore.Remove(start, end + k_IgnoreEnd.Length - start);
-		}
-		ignore = $"{ignore.TrimEnd('\n')}\n\n{k_IgnoreStart}\n{string.Concat(patterns.Select(p => $"/{p}\n"))}{k_IgnoreEnd}\n";
-		File.WriteAllText(ignorePath, original.Contains("\r\n") ? ignore.Replace("\n", "\r\n") : ignore);
-
-		// The key's place depends on the bucket, which may just have changed
-		DLF.keyPath = null;
-		if (DLF.keyPath.Length == 0) {
-			Debug.LogWarning("DLF: the write key was not saved, because git could not be run in this project.");
-		}
-		else if (m_WriteKeySecret.Length == 0) {
-			File.Delete(DLF.keyPath);
-		}
-		else {
-			Directory.CreateDirectory(Path.GetDirectoryName(DLF.keyPath));
-			File.WriteAllText(DLF.keyPath, $"accessKeyId={m_WriteKeyId}\nsecretAccessKey={m_WriteKeySecret}\n");
-			DLF.InstallHooks();
-		}
+		var badge = new Rect(row.x + 20, row.y + 2, 16, row.height - 4);
+		EditorGUI.DrawRect(badge, k_Colors.TryGetValue(change[0], out var color) ? color : Color.gray);
+		GUI.Label(badge, change.Substring(0, 1), s_Badge);
+		var name = new GUIContent(Path.GetFileName(path), path);
+		var width = Mathf.Min(EditorStyles.label.CalcSize(name).x, row.width - 60);
+		GUI.Label(new Rect(row.x + 42, row.y, width, row.height), name);
+		GUI.Label(new Rect(row.x + 46 + width, row.y, row.width - 46 - width, row.height), Path.GetDirectoryName(path)?.Replace('\\', '/'), s_Folder);
 	}
 }

@@ -1,20 +1,11 @@
 #!/bin/sh
-# On a machine that publishes (it has a write key): when the shared large files changed, DLF.txt is rewritten to name
-# the new set and the commit is stopped once, so that DLF.txt can go into the same commit as the changes that need
-# the new files. Pushing uploads them (pre-push).
+# A reminder only, on a machine with a write key: it changes nothing and never stops a commit. It speaks up when shared
+# large files changed here and were not uploaded, or when DLF.txt changed and is left out of the commit.
 . "$(dirname "$0")/dlf.sh"
 [ -f "$keys" ] || exit 0
-current=$(current_set)
-[ -s "$state/index" ] || exit 0
-pointer=$(cat DLF.txt 2> /dev/null | tr -d '\r\n')
-[ "$current" = "$pointer" ] && exit 0
-base=$(cat "$state/base" 2> /dev/null)
-# A checkout that never fetched the project's set cannot tell a change from an old copy: it names nothing
-[ -n "$pointer" ] && [ -z "$base" ] && exit 0
-# The files are still the ones last seen in the bucket: this branch just names another set
-[ "$current" = "$base" ] && exit 0
-name_current "$current"
-# Not staged here: which commit the new set belongs to is the author's call
-echo "DLF: the shared large files changed, and DLF.txt now names the new set." >&2
-echo "Commit stopped once: stage DLF.txt if this commit should carry the new files, then commit again." >&2
-exit 1
+if [ -f "$state/synced" ] && ! unchanged; then
+	echo "DLF: shared large files changed on this machine and are not uploaded. If this commit needs them, use Upload in the DLF window (Tools > DLF > DLF) and commit DLF.txt with it." >&2
+elif [ -n "$(git diff --name-only -- DLF.txt)" ]; then
+	echo "DLF: DLF.txt has changes that are not part of this commit. Stage it if this commit needs the new files." >&2
+fi
+exit 0

@@ -11,8 +11,8 @@ using UnityEngine;
 /// <summary>
 /// The Unity side of DLF (Derek's Large Files), which keeps files that are too large for git in an S3 bucket.
 /// All of DLF's logic is in the shell scripts of the Hooks~ folder: this class only runs them. It fetches the set of
-/// files the checked-out commit names (on start, when the Editor regains focus, before a build and from the menu),
-/// resets files to the bucket's, and on a machine with a write key adds DLF's hooks to the repository's git hooks.
+/// files the checked-out commit lists (on start, when the Editor regains focus and before a build), and on a machine
+/// with a write key adds DLF's hooks to the repository's git hooks. Everything a person does goes through DLFWindow.
 /// See README.md.
 /// </summary>
 public sealed class DLF : IPreprocessBuildWithReport {
@@ -37,7 +37,7 @@ public sealed class DLF : IPreprocessBuildWithReport {
 		if (!File.Exists(At(k_PointerName))) {
 			return;
 		}
-		var (code, _, messages) = Run("fetch");
+		var (code, _, messages) = Run("download", new[] { "auto" });
 		AssetDatabase.Refresh();
 		if (code != 0) {
 			throw new BuildFailedException(messages);
@@ -62,10 +62,12 @@ public sealed class DLF : IPreprocessBuildWithReport {
 		}
 	}
 
-	// Once per set a commit names: a set that cannot be fetched is not asked for again on every focus
+	// Once per list of files a commit has: one that cannot be fetched is not asked for again on every focus
 	private static void QueueFetch() {
-		var pointer = File.Exists(At(k_PointerName)) ? File.ReadAllText(At(k_PointerName)).Trim() : "";
-		if (Application.isBatchMode || pointer.Length == 0 || pointer == SessionState.GetString(k_TriedKey, "")) {
+		var list = File.Exists(At(k_PointerName)) ? File.ReadAllText(At(k_PointerName)) : "";
+		// The list can be long: its length and hash code stand for it
+		var pointer = $"{list.Length}:{list.GetHashCode()}";
+		if (Application.isBatchMode || list.Length == 0 || pointer == SessionState.GetString(k_TriedKey, "")) {
 			return;
 		}
 		EditorApplication.delayCall += () => {
@@ -73,41 +75,8 @@ public sealed class DLF : IPreprocessBuildWithReport {
 				return;
 			}
 			SessionState.SetString(k_TriedKey, pointer);
-			Report(Run("fetch"));
+			Report(Run("download", new[] { "auto" }));
 		};
-	}
-
-	[MenuItem("Tools/DLF/Fetch")]
-	private static void Fetch() {
-		Report(Run("fetch"));
-	}
-
-	// Uploads the set the checked-out commit names, as pushing that commit would, without pushing anything
-	[MenuItem("Tools/DLF/Publish")]
-	private static void Publish() {
-		Report(Run("publish"));
-	}
-
-	[MenuItem("Tools/DLF/Reset All To Remote")]
-	private static void ResetAll() {
-		if (EditorUtility.DisplayDialog("DLF", "Replace all shared files on this machine with the ones in the bucket? Local changes to them are lost.", "Reset", "Cancel")) {
-			Report(Run("reset"));
-		}
-	}
-
-	// What is selected in the Project window, with its .meta files; a folder stands for all below it
-	[MenuItem("Tools/DLF/Reset Selected To Remote")]
-	private static void ResetSelected() {
-		var root = At(".");
-		var selection = Selection.assetGUIDs.Select(AssetDatabase.GUIDToAssetPath).Select(p => Path.GetRelativePath(root, Path.GetFullPath(p)).Replace('\\', '/')).ToList();
-		if (EditorUtility.DisplayDialog("DLF", "Replace the selected shared files on this machine with the ones in the bucket? Local changes to them are lost.", "Reset", "Cancel")) {
-			Report(Run("reset", selection));
-		}
-	}
-
-	[MenuItem("Tools/DLF/Reset Selected To Remote", true)]
-	private static bool CanResetSelected() {
-		return Selection.assetGUIDs.Length > 0;
 	}
 
 	private static void Report((int code, string output, string messages) result) {
@@ -120,13 +89,19 @@ public sealed class DLF : IPreprocessBuildWithReport {
 		}
 	}
 
-	// Runs a command of the dlf script (Hooks~/dlf) and waits for it, with a progress bar that can cancel it.
-	// Git runs the script with the shell it brings, from the top of the repository: no shell has to be installed or found
-	private static (int code, string output, string messages) Run(string command, IEnumerable<string> arguments = null) {
+	// What git is started with to run a command of the dlf script
+	internal static string Arguments(string command, IEnumerable<string> arguments = null) {
 		var line = new StringBuilder($"-c \"alias.dlf=!sh \\\"{Scripts()}/dlf\\\"\" dlf {command}");
 		foreach (var argument in arguments ?? Enumerable.Empty<string>()) {
 			line.Append($" \"{argument.Replace("\"", "\\\"")}\"");
 		}
+		return line.ToString();
+	}
+
+	// Runs a command of the dlf script (Hooks~/dlf) and waits for it, with a progress bar that can cancel it.
+	// Git runs the script with the shell it brings, from the top of the repository: no shell has to be installed or found
+	internal static (int code, string output, string messages) Run(string command, IEnumerable<string> arguments = null) {
+		var line = Arguments(command, arguments);
 		var output = new StringBuilder();
 		var messages = new StringBuilder();
 		var progress = "";
