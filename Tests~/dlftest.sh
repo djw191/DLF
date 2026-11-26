@@ -203,6 +203,7 @@ echo "$E codec.cs" >> DLF.txt; check "download refuses a file git keeps" "$(dlf 
 check "and leaves it alone" "$(git status --short codec.cs | wc -l | tr -d ' ')" 0
 git checkout -q -- DLF.txt; echo "$E .git/hooks/post-checkout" >> DLF.txt; check "download refuses git's own folder" "$(dlf download 2>&1 | grep -c "git's own folder")$(has .git/hooks/post-checkout)" 1gone
 git checkout -q -- DLF.txt; echo "$E Big/.GIT/x" >> DLF.txt; check "whatever the case of its name" "$(dlf download 2>&1 | grep -c "git's own folder")" 1
+git checkout -q -- DLF.txt; tail -n 1 DLF.txt >> DLF.txt; check "a path listed twice is refused" "$(dlf download 2>&1 | grep -c 'twice')" 1
 git checkout -q -- DLF.txt; echo "abc123 Big/short.bin" >> DLF.txt; check "and a line without a whole hash" "$(dlf download 2>&1 | grep -c 'not a list of files')" 1
 git checkout -q -- DLF.txt
 printf '<<<<<<< HEAD\n' >> DLF.txt
@@ -293,6 +294,11 @@ check "and is not in the bucket" "$(has "${O}files__$(echo unpicked | sha256sum 
 check "status: the other is still changed here, nothing to download" "$(status 'changed|incoming')" "changed=M Big/c.bin "
 check "the change stays on this machine" "$(cat Big/c.bin)" unpicked
 dlf reset > /dev/null 2>&1; git checkout -q -- DLF.txt; dlf reset > /dev/null 2>&1
+sleep 1; echo from-file > Big/a.bin; echo not-picked > Big/c.bin; printf 'Big/a.bin\n' > "$T/picks"
+dlf upload --paths-from "$T/picks" > /dev/null 2>&1; check "an upload of the paths in a file succeeds" $? 0
+check "it shares the picked file and not the other" "$(grep -c -e "^$(echo from-file | sha256sum | cut -c1-64) " -e "^$(echo not-picked | sha256sum | cut -c1-64) " DLF.txt)" 1
+printf 'Big\n' > "$T/picks"; dlf reset --paths-from "$T/picks" > /dev/null 2>&1; check "a reset of a picked folder resets what is in it" "$(cat Big/c.bin)" moved-on
+git checkout -q -- DLF.txt; dlf reset > /dev/null 2>&1
 
 echo "--- 13c hooks and .gitignore"
 git init -q -b main "$T/i"; cd "$T/i"; git config user.name i; git config user.email i@t; git config core.autocrlf false

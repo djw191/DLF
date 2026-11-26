@@ -2,12 +2,14 @@
 # The DLF command, run from the top of the repository (Unity runs it for the DLF window, on start and before a build):
 #   dlf download [--missing]  takes what is new in DLF.txt, file by file: files changed on this machine are left
 #                        alone. With --missing (the Download button), files deleted here come back too
-#   dlf upload [PATH...] lists the shared files as they are now in DLF.txt and puts them in the bucket; with paths,
-#                        only those of the files changed here
-#   dlf reset [PATH...]  throws changes made on this machine away: the shared files, or only the selected ones,
-#                        become the ones DLF.txt lists
+#   dlf upload [PATH... | --paths-from FILE]  lists the shared files as they are now in DLF.txt and puts them in the
+#                        bucket; with paths, only those of the files changed here
+#   dlf reset [PATH... | --paths-from FILE]  throws changes made on this machine away: the shared files, or only the
+#                        picked ones, become the ones DLF.txt lists
+#   Paths can come in a file, one per line, as the Unity window passes them: a command line has a length limit
 #   dlf unlock           clears a lock an upload left behind
-#   dlf status           prints what the DLF window shows: this machine's files, DLF.txt, and the bucket
+#   dlf status [local | server]  prints what the DLF window shows: this machine's files and DLF.txt (local), and what
+#                        the bucket says (server); both without either
 #   dlf keypath          prints where this machine's write key is kept
 #   dlf install          on a machine with a write key, puts DLF's reminders in the git hooks (Unity runs it on every reload)
 #   dlf ignore           lists the patterns of DLF.cfg in .gitignore
@@ -16,6 +18,18 @@
 command=$1
 [ $# -gt 0 ] && shift
 case "$command" in download | upload | reset) hold ;; esac
+# The paths picked for upload or reset, in a file: the one given, or the arguments written to one
+picks=
+case "$command" in upload | reset)
+	if [ "$1" = --paths-from ]; then
+		picks=$2
+		[ -f "$picks" ] || fail "the list of picked files is not there: $picks"
+	elif [ $# -gt 0 ]; then
+		printf '%s\n' "$@" > "$work/picks"
+		picks="$work/picks"
+	fi
+	;;
+esac
 case "$command" in
 	keypath)
 		printf '%s\n' "$keys"
@@ -32,15 +46,15 @@ case "$command" in
 		;;
 	upload)
 		branch=$(current_branch) || fail "nothing to upload: no branch is checked out."
-		upload "$branch" "$@"
+		upload "$branch" "$picks"
 		;;
 	reset)
 		[ -f DLF.txt ] || fail "there is no DLF.txt yet, so there is nothing to reset to."
 		use_read_key
-		if [ $# -eq 0 ]; then
+		if [ -z "$picks" ]; then
 			sync --all
 		else
-			sync "$@"
+			sync --picks "$picks"
 		fi
 		report_conflicts
 		;;
@@ -60,7 +74,7 @@ case "$command" in
 		use_write_key
 		get lock "$work/lock"
 		IFS='|' read -r owner since what < "$work/lock" || true
-		if [ "$owner" = "$me" ]; then
+		if [ "$owner" = "$(who)" ]; then
 			r2 DELETE lock > /dev/null || fail "could not clear the lock."
 		fi
 		;;
@@ -72,40 +86,45 @@ case "$command" in
 	status)
 		# For the DLF window: one name=value line per fact. The bucket is asked last; when it cannot be reached, the
 		# facts about this machine are still there
-		echo "project=$project"
-		echo "branch=$(current_branch)"
-		if [ -f "$keys" ]; then echo "key=write"; elif [ -n "$(value readSecretAccessKey "$cfg")" ]; then echo "key=read"; else echo "key=none"; fi
-		if [ -f DLF.txt ]; then
-			echo "files=$(wc -l < DLF.txt | tr -d ' ')"
-			if [ -z "$(git status --porcelain -- DLF.txt)" ]; then echo "committed=yes"; else echo "committed=no"; fi
-			# A commit that changed DLF.txt and is on no remote yet; and one on the branch's remote that is not here yet,
-			# as of the last fetch (this asks no server)
-			if [ -n "$(git remote)" ] && [ -n "$(git rev-list -n 1 HEAD --not --remotes -- DLF.txt 2> /dev/null)" ]; then echo "pushed=no"; fi
-			if [ -n "$(git rev-list -n 1 'HEAD..@{upstream}' -- DLF.txt 2> /dev/null)" ]; then echo "behind=yes"; fi
+		if [ "$1" != server ]; then
+			echo "project=$project"
+			echo "branch=$(current_branch)"
+			if [ -f "$keys" ]; then echo "key=write"; elif [ -n "$cfg_readSecretAccessKey" ]; then echo "key=read"; else echo "key=none"; fi
+			if [ -f DLF.txt ]; then
+				echo "files=$(awk 'END { print NR }' DLF.txt)"
+				if [ -z "$(git status --porcelain -- DLF.txt)" ]; then echo "committed=yes"; else echo "committed=no"; fi
+				# A commit that changed DLF.txt and is on no remote yet; and one on the branch's remote that is not here yet,
+				# as of the last fetch (this asks no server)
+				if [ -n "$(git remote)" ] && [ -n "$(git rev-list -n 1 HEAD --not --remotes -- DLF.txt 2> /dev/null)" ]; then echo "pushed=no"; fi
+				if [ -n "$(git rev-list -n 1 'HEAD..@{upstream}' -- DLF.txt 2> /dev/null)" ]; then echo "behind=yes"; fi
+			fi
+			# Per file, as git status does. "changed": this machine's files against the list it last took (added, deleted,
+			# or written since). "incoming": that list against DLF.txt, which is what a download would bring
+			synced=
+			[ -f "$state/synced" ] && read -r synced < "$state/synced"
+			if [ -n "$synced" ] && git cat-file blob "$synced" > "$work/have" 2> /dev/null; then :; else : > "$work/have"; fi
+			[ -f "$state/seen" ] && cp "$state/seen" "$work/before" || : > "$work/before"
+			[ -f DLF.txt ] && cp DLF.txt "$work/want" || : > "$work/want"
+			seen > "$work/now"
+			# All in one pass, as one program. A line of a list is a 64 character hash, a space and the path; a line of what
+			# was seen is "size/time/path"
+			awk -v listed="$([ -f DLF.txt ] && echo 1)" '
+				FILENAME == ARGV[1] { have[$0]; had[substr($0, 66)]; next }
+				FILENAME == ARGV[2] { before[$0]; next }
+				FILENAME == ARGV[3] { path = $0; sub(/^[^\/]*\/[^\/]*\//, "", path); here[path]; if (!($0 in before)) touched[path]; next }
+				{ sub(/\r$/, ""); want[$0]; wanted[substr($0, 66)] }
+				END {
+					for (path in here) {
+						if (!(path in had)) print "changed=A " path
+						else if (path in touched) print "changed=M " path
+					}
+					for (path in had) if (!(path in here)) print "changed=D " path
+					if (!listed) exit
+					for (line in want) if (!(line in have)) print "incoming=" (substr(line, 66) in had ? "M " : "A ") substr(line, 66)
+					for (path in had) if (!(path in wanted)) print "incoming=D " path
+				}' "$work/have" "$work/before" "$work/now" "$work/want"
+			rm -f "$work/have" "$work/before" "$work/now" "$work/want"
 		fi
-		# Per file, as git status does. "changed": this machine's files against the list it last took (added, deleted,
-		# or written since). "incoming": that list against DLF.txt, which is what a download would bring
-		if [ -f "$state/synced" ] && git cat-file -e "$(cat "$state/synced")" 2> /dev/null; then
-			git cat-file blob "$(cat "$state/synced")" | sort > "$work/have"
-		else
-			: > "$work/have"
-		fi
-		cut -d' ' -f2- "$work/have" | sort > "$work/have.paths"
-		shared_files | tr '\000' '\n' | sort > "$work/here"
-		comm -13 "$work/have.paths" "$work/here" | sed 's/^/changed=A /'
-		comm -23 "$work/have.paths" "$work/here" | sed 's/^/changed=D /'
-		# Modified: there before and now, with another size or time than when this machine last took the list
-		seen | sort > "$work/now"
-		sort "$state/seen" 2> /dev/null | comm -13 - "$work/now" | cut -d/ -f3- | sort > "$work/touched"
-		comm -12 "$work/have.paths" "$work/here" | comm -12 - "$work/touched" | sed 's/^/changed=M /'
-		if [ -f DLF.txt ]; then
-			tr -d '\r' < DLF.txt | sort > "$work/want"
-			comm -13 "$work/have" "$work/want" | cut -d' ' -f2- | sort > "$work/in"
-			comm -12 "$work/in" "$work/have.paths" | sed 's/^/incoming=M /'
-			comm -23 "$work/in" "$work/have.paths" | sed 's/^/incoming=A /'
-			cut -d' ' -f2- "$work/want" | sort | comm -23 "$work/have.paths" - | sed 's/^/incoming=D /'
-		fi
-		rm -f "$work/have" "$work/have.paths" "$work/here" "$work/want"
 		# "status local" stops here: quick, and without asking the bucket
 		[ "$1" = local ] && exit 0
 		(

@@ -45,6 +45,17 @@ public sealed class DLF : IPreprocessBuildWithReport {
 	// True while a download, upload, reset or unlock runs in the background: one at a time
 	internal static bool busy { get; private set; }
 
+	// The run that busy stands for, for the DLF window's own progress bar: its title, the step it is at and how far it is
+	// (0 when there is nothing to count), and how to cancel it, the same as from Unity's Background Tasks
+	internal static string runTitle { get; private set; } = "";
+	internal static string runStep { get; private set; } = "";
+	internal static float runFraction { get; private set; }
+	private static Action s_Cancel;
+
+	internal static void CancelRun() {
+		s_Cancel?.Invoke();
+	}
+
 	public int callbackOrder => 0;
 
 	public void OnPreprocessBuild(BuildReport report) {
@@ -232,13 +243,19 @@ public sealed class DLF : IPreprocessBuildWithReport {
 		Job job = null;
 		if (title != null) {
 			busy = true;
-			// The title names the run; the description below it follows the step the script is at
-			id = Progress.Start(title, "Starting");
-			Progress.RegisterCancelCallback(id, () => {
+			runTitle = title;
+			runStep = "Starting";
+			runFraction = 0;
+			s_Cancel = () => {
 				var running = job;
 				if (running != null) {
 					Stop(running.process);
 				}
+			};
+			// The title names the run; the description below it follows the step the script is at
+			id = Progress.Start(title, "Starting");
+			Progress.RegisterCancelCallback(id, () => {
+				s_Cancel?.Invoke();
 				return true;
 			});
 		}
@@ -255,6 +272,8 @@ public sealed class DLF : IPreprocessBuildWithReport {
 					shown = progress;
 					var (done, total, text) = Parse(progress);
 					s_MainThread.Enqueue(() => {
+						runStep = text;
+						runFraction = total > 0 ? (float)done / total : 0;
 						if (!Progress.Exists(id)) {
 							return;
 						}
@@ -274,6 +293,8 @@ public sealed class DLF : IPreprocessBuildWithReport {
 			s_MainThread.Enqueue(() => {
 				if (id >= 0) {
 					busy = false;
+					runTitle = runStep = "";
+					s_Cancel = null;
 					if (Progress.Exists(id) && Progress.GetStatus(id) == Progress.Status.Running) {
 						Progress.Finish(id, result.code == 0 ? Progress.Status.Succeeded : Progress.Status.Failed);
 					}

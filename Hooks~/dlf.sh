@@ -25,17 +25,18 @@ cfg=DLF.cfg
 
 value() { sed -n "s/^$1=//p" "$2" 2>/dev/null | tr -d '\r' | head -n 1; }
 
-endpoint=$(value endpoint "$cfg")
-endpoint=${endpoint%/}
-bucket=$(value bucket "$cfg")
-project=$(value project "$cfg")
-region=$(value region "$cfg")
-region=${region:-auto}
+# Every "name=value" line of DLF.cfg, the first of each name, as the variable cfg_<name>; read in one go, as starting a
+# program costs some 30 ms on Windows. The values are quoted for the shell, whatever they hold
+eval "$(awk 'BEGIN { q = "\047" } { sub(/\r$/, "") } match($0, /^[A-Za-z]+=/) { n = substr($0, 1, RLENGTH - 1); if (n in done) next; done[n]; v = substr($0, RLENGTH + 1); gsub(q, q "\\" q q, v); print "cfg_" n "=" q v q }' "$cfg" 2> /dev/null)"
+endpoint=${cfg_endpoint%/}
+bucket=$cfg_bucket
+project=$cfg_project
+region=${cfg_region:-auto}
 # keepOldVersions=true: files stay in the bucket for good, so that every commit can still download its own
-keep=$(value keepOldVersions "$cfg")
+keep=$cfg_keepOldVersions
 # oneSetForAllBranches=true: every branch uploads to the same list, so the bucket holds what was uploaded last,
 # whichever branch it was on. Otherwise each branch has its own list
-one_set=$(value oneSetForAllBranches "$cfg")
+one_set=$cfg_oneSetForAllBranches
 # The write key is kept per machine and per bucket, outside the repository
 keys="${APPDATA:-${XDG_CONFIG_HOME:-$HOME/.config}}/DLF/$bucket.cfg"
 state="$(git rev-parse --git-dir)/dlf"
@@ -50,15 +51,11 @@ cleanup() {
 	rm -rf "$work"
 }
 trap cleanup EXIT
-# What a command that was killed left behind
-find "$state" -maxdepth 1 -name 'work.*' -mmin +1440 -exec rm -rf {} + 2> /dev/null
-# Who holds the lock: the same person on another machine is someone else
-me="$(git config user.name)@$(uname -n)"
 hasher=sha256sum
 command -v sha256sum > /dev/null 2>&1 || hasher="shasum -a 256"
-# Prints "size/time/path" of a file: GNU's stat, or BSD's
-stat="stat -c %s/%Y/%n"
-stat -c %s . > /dev/null 2>&1 || stat="stat -f %z/%m/%N"
+
+# Who holds the lock: the same person on another machine is someone else. Asked for only when a lock is
+who() { printf '%s@%s' "$(git config user.name)" "$(uname -n)"; }
 # A lock older than this is left over from an upload that died, and is ignored
 lock_seconds=3600
 
@@ -84,14 +81,19 @@ forget_seen() {
 # The files the patterns match, sorted and NUL separated. Git does the matching, the same way on every system:
 # * and ? stay within one folder or file name, ** crosses folders
 shared_files() {
-	patterns=$(sed -n 's/^pattern=//p' "$cfg" | tr -d '\r')
-	[ -n "$patterns" ] || return 0
-	printf '%s\n' "$patterns" | sed 's/^/:(top,glob)/' | tr '\n' '\0' | xargs -0 git ls-files --others --full-name -z -- | sort -z
+	awk '{ sub(/\r$/, "") } sub(/^pattern=/, "") && length($0) { print ":(top,glob)" $0 }' "$cfg" > "$work/patterns"
+	[ -s "$work/patterns" ] || return 0
+	tr '\n' '\0' < "$work/patterns" | xargs -0 git ls-files --others --full-name -z -- | sort -z
 }
 
 # Prints the size and time of every shared file. Telling by these whether a file changed needs no hashing, and
 # also catches a file copied in from elsewhere, which keeps its old time
 seen() {
+	# GNU's stat, or BSD's
+	if [ -z "$stat" ]; then
+		stat="stat -c %s/%Y/%n"
+		stat -c %s . > /dev/null 2>&1 || stat="stat -f %z/%m/%N"
+	fi
 	shared_files > "$work/seen.names"
 	[ -s "$work/seen.names" ] && xargs -0 $stat < "$work/seen.names"
 	rm -f "$work/seen.names"
@@ -170,8 +172,8 @@ use_read_key() {
 	if [ -f "$keys" ]; then
 		use_write_key
 	else
-		[ -n "$(value readSecretAccessKey "$cfg")" ] || fail "DLF.cfg has no read key. Enter one in the DLF settings (Tools > DLF, then the gear)."
-		use_key "$(value readAccessKeyId "$cfg")" "$(value readSecretAccessKey "$cfg")"
+		[ -n "$cfg_readSecretAccessKey" ] || fail "DLF.cfg has no read key. Enter one in the DLF settings (Tools > DLF, then the gear)."
+		use_key "$cfg_readAccessKeyId" "$cfg_readSecretAccessKey"
 	fi
 }
 
@@ -241,7 +243,7 @@ check_lock() {
 	get lock "$work/lock"
 	IFS='|' read -r owner since what < "$work/lock" || true
 	rm -f "$work/lock"
-	if [ -n "$since" ] && [ $(($(date +%s) - since)) -lt $lock_seconds ] && [ "$owner" != "$me" ]; then
+	if [ -n "$since" ] && [ $(($(date +%s) - since)) -lt $lock_seconds ] && [ "$owner" != "$(who)" ]; then
 		who=$(printf '%s' "$owner" | sed 's/@\(.*\)/ (on \1)/')
 		fail "$who is uploading large files right now. Try again in a moment. (If that upload was cut off, Unlock in the DLF window clears it.)"
 	fi
@@ -250,6 +252,8 @@ check_lock() {
 # Only one download, upload or reset at a time on this machine: they write the same files and markers. The mark of a
 # run that was killed is taken over
 hold() {
+	# What a command that was killed left behind
+	find "$state" -maxdepth 1 -name 'work.*' -mmin +1440 -exec rm -rf {} + 2> /dev/null
 	if ! mkdir "$state/busy" 2> /dev/null; then
 		pid=$(cat "$state/busy/pid" 2> /dev/null)
 		# A mark without a number is one another run made a moment ago
@@ -263,14 +267,18 @@ hold() {
 	echo $$ > "$state/busy/pid"
 }
 
-# True when the path is among the selected ones: the path itself, its .meta, or anything in a selected folder
-selected() {
-	path=$1
-	shift
-	for choice; do
-		case "$path" in "$choice" | "$choice.meta" | "$choice"/*) return 0 ;; esac
-	done
-	return 1
+# unpicked PICKS: the paths on the input that the file PICKS does not select. A picked path selects itself, its .meta,
+# and anything in it when it is a folder. One pass, however many paths there are on either side
+unpicked() {
+	awk 'FILENAME == ARGV[1] { sub(/\r$/, ""); if (length($0)) pick[$0]; next }
+		{
+			if ($0 in pick) next
+			main = $0
+			if (sub(/\.meta$/, "", main) && (main in pick)) next
+			folder = $0
+			while (sub(/\/[^\/]*$/, "", folder)) if (folder in pick) next
+			print
+		}' "$1" -
 }
 
 # apply LIST: makes the local shared files the ones the sorted list in the file LIST names. Files it does not name
@@ -330,10 +338,10 @@ differing() { sort "$1" "$2" | uniq -u | cut -d' ' -f2- | sort -u; }
 # A line is a 64 character hash, a space, and the path
 lines_at() { awk -v wanted="$3" 'FILENAME == ARGV[1] { named[$0]; next } ((substr($0, 66) in named) == wanted)' "$1" "$2"; }
 
-# sync [--all | --missing | PATH...]: brings the shared files in line with DLF.txt, file by file, the way git merges.
+# sync [--all | --missing | --picks FILE]: brings the shared files in line with DLF.txt, file by file, the way git merges.
 # Compared with the list this machine last took: a file that only changed in DLF.txt is downloaded (or removed), a file
 # that only changed here is left alone, and a file that changed on both sides is left alone and named in
-# $work/conflicts. Changes made here to the selected paths, or with --all to any, are thrown away instead: those files
+# $work/conflicts. Changes made here to the paths FILE picks, or with --all to any, are thrown away instead: those files
 # become the listed ones too. With --missing, files deleted here come back; other changes made here are kept
 sync() {
 	tr -d '\r' < DLF.txt | sort > "$work/theirs"
@@ -345,6 +353,8 @@ sync() {
 		# Whatever the case of its name: Windows does not tell .GIT from .git
 		case "$path" in [.][Gg][Ii][Tt]/* | */[.][Gg][Ii][Tt]/*) fail "the list of shared files names a file in git's own folder: $path" ;; esac
 	done < "$work/theirs"
+	twice=$(cut -d' ' -f2- "$work/theirs" | sort | uniq -d | head -n 1)
+	[ -z "$twice" ] || fail "DLF.txt lists $twice twice. If git left a merge conflict in it, keep one line for each file."
 	if [ -s "$work/theirs" ]; then
 		tracked=$(cut -d' ' -f2- "$work/theirs" | tr '\n' '\0' | xargs -0 git --literal-pathspecs ls-files -- | head -n 1)
 		[ -z "$tracked" ] || fail "the list of shared files names a file that git keeps: $tracked. Take it out of git (git rm --cached) or out of DLF.txt."
@@ -360,12 +370,10 @@ sync() {
 		: > "$work/kept"
 	elif [ "$1" = --missing ]; then
 		cut -d' ' -f2- "$work/have" | sort | comm -12 "$work/changed" - > "$work/kept"
-	elif [ $# -eq 0 ]; then
-		cp "$work/changed" "$work/kept"
+	elif [ "$1" = --picks ]; then
+		unpicked "$2" < "$work/changed" > "$work/kept"
 	else
-		while IFS= read -r path; do
-			selected "$path" "$@" || printf '%s\n' "$path"
-		done < "$work/changed" > "$work/kept"
+		cp "$work/changed" "$work/kept"
 	fi
 	# A change made here that gives the listed file anyway is no change to keep
 	differing "$work/have" "$work/theirs" | comm -12 - "$work/kept" > "$work/both"
@@ -405,13 +413,13 @@ report_conflicts() {
 	rm -f "$work/conflicts"
 }
 
-# upload BRANCH [PATH...]: lists the shared files as they are now in DLF.txt and puts them in the bucket as BRANCH's
-# set. With paths, only the files changed here that they select are shared: the other changes stay on this machine,
+# upload BRANCH [PICKS]: lists the shared files as they are now in DLF.txt and puts them in the bucket as BRANCH's
+# set. With a file of picked paths, only the files changed here that it selects are shared: the other changes stay on this machine,
 # and DLF.txt keeps listing those files as before. New files go up first, then the branch's list, then files nothing
 # needs any more are removed. DLF.txt is left for the author to commit. Stops when it must not replace what is there
 upload() {
 	branch=$1
-	shift
+	picks=$2
 	merged=
 	use_write_key
 	# What DLF.txt lists and this machine never took is taken first, file by file: an upload lists the files as they
@@ -432,7 +440,7 @@ upload() {
 		current_list > "$work/now"
 	fi
 	: > "$work/unpicked"
-	if [ $# -eq 0 ]; then
+	if [ -z "$picks" ]; then
 		mv "$work/now" "$work/new"
 	else
 		# The files changed here and not selected keep the line the list last taken has for them (none: not shared yet)
@@ -442,9 +450,7 @@ upload() {
 			: > "$work/base"
 		fi
 		sort "$work/now" > "$work/now.sorted"
-		differing "$work/base" "$work/now.sorted" | while IFS= read -r path; do
-			selected "$path" "$@" || printf '%s\n' "$path"
-		done > "$work/unpicked"
+		differing "$work/base" "$work/now.sorted" | unpicked "$picks" > "$work/unpicked"
 		{
 			lines_at "$work/unpicked" "$work/now" 0
 			lines_at "$work/unpicked" "$work/base" 1
@@ -478,7 +484,7 @@ upload() {
 	# shortcut: a lock left behind is deleted before the new one is written, and two uploaders doing that in the same
 	# moment could both get in; replace it with a write that needs the old lock's ETag (If-Match) if that ever happens
 	[ -n "$since" ] && r2 DELETE lock > /dev/null 2>&1
-	printf '%s|%s|%s' "$me" "$(date +%s)" "$branch" > "$work/lock"
+	printf '%s|%s|%s' "$(who)" "$(date +%s)" "$branch" > "$work/lock"
 	# The bucket only takes this write while there is no lock: of two uploaders starting together, one is refused
 	put lock "$work/lock" -H 'If-None-Match: *' 2> /dev/null || fail "not uploaded: someone else started uploading at the same moment, or the server could not be reached. Try again."
 	rm -f "$work/lock"
